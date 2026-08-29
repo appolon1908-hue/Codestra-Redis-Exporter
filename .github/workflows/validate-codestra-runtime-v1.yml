@@ -32,7 +32,9 @@ jobs:
         working-directory: upstream
         run: go build -trimpath -o ../.tmp-redis-exporter .
       - name: Prove password-file support from the exact source snapshot
-        run: ./.tmp-redis-exporter --help 2>&1 | grep -q -- '--redis.password-file'
+        run: |
+          ./.tmp-redis-exporter --help 2>&1 | grep -Eq -- '(^|[[:space:]])-{1,2}redis\.password-file([[:space:]]|$)'
+          grep -q 'REDIS_PASSWORD_FILE' upstream/main.go
       - name: Install pinned YAML parser
         run: python -m pip install --disable-pip-version-check PyYAML==6.0.2
       - name: Validate security and metric contracts
@@ -65,5 +67,18 @@ jobs:
           assert contract["rules"]["monitoringAclIsReadOnly"] is True
           assert "latest" not in text.lower()
           print("Codestra Redis Exporter runtime validation PASS")
-      - name: Validate Compose structure without resolving runtime values
-        run: docker compose -f codestra/runtime-v1/compose.yaml config --no-interpolate >/dev/null
+      - name: Render Compose with non-secret CI values
+        env:
+          REDIS_EXPORTER_IMAGE: oliver006/redis_exporter:ci@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          REDIS_ADDR: rediss://redis.internal:6379
+          REDIS_MONITOR_USER: codestra_monitor
+          REDIS_MONITOR_PASSWORD_FILE: /tmp/codestra-redis-exporter-password
+          CODESTRA_BUSINESS: platform
+          CODESTRA_APPLICATION: shared-cache
+          CODESTRA_ENVIRONMENT: test
+          CODESTRA_DEPLOYMENT: exact-head-ci
+        run: |
+          printf 'non-secret-ci-placeholder\n' > "$REDIS_MONITOR_PASSWORD_FILE"
+          docker compose -f codestra/runtime-v1/compose.yaml config >/tmp/codestra-redis-exporter-runtime.yaml
+          test -s /tmp/codestra-redis-exporter-runtime.yaml
+          ! grep -Eq ':latest([[:space:]]|$)|published:|host_ip:|redis://:[^[:space:]]' /tmp/codestra-redis-exporter-runtime.yaml
