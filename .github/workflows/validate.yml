@@ -1,0 +1,54 @@
+name: Validate Redis Exporter authority
+
+on:
+  pull_request:
+  push:
+    branches: [development, test, staging, production, main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Render and inspect compose authority
+        env:
+          REDIS_EXPORTER_IMAGE: example.invalid/redis-exporter@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          REDIS_ADDR: redis://redis:6379
+          REDIS_EXPORTER_USER: codestra_exporter
+          REDIS_EXPORTER_PASSWORD_SECRET: codestra-redis-exporter-password
+          CODESTRA_OBSERVABILITY_NETWORK: codestra-observability
+          CODESTRA_CACHE_NETWORK: codestra-cache
+        run: |
+          set -euo pipefail
+          docker compose -f deploy/compose.yaml config --format json > /tmp/compose.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          config = json.loads(Path('/tmp/compose.json').read_text())
+          service = config['services']['redis-exporter']
+          assert '@sha256:' in service['image']
+          assert service['user'] == '65534:65534'
+          assert service['read_only'] is True
+          assert service['cap_drop'] == ['ALL']
+          assert not service.get('ports')
+          assert service['expose'] == ['9121']
+          env = service['environment']
+          assert env['REDIS_PASSWORD_FILE'] == '/run/secrets/redis_exporter_password'
+          assert env['REDIS_EXPORTER_DISABLE_SCRAPE_ENDPOINT'] == 'true'
+          assert env['REDIS_EXPORTER_EXPORT_CLIENT_PORT'] == 'false'
+          assert env['REDIS_EXPORTER_CONFIG_COMMAND'] == '-'
+          assert 'REDIS_PASSWORD' not in env
+          assert set(service['networks']) == {'observability', 'cache'}
+          assert config['networks']['observability']['external'] is True
+          assert config['networks']['cache']['external'] is True
+          PY
+      - name: Reject mutable images and inline credentials
+        run: |
+          set -euo pipefail
+          ! grep -RInE 'image:.*(:latest|:[[:space:]]*$)' deploy
+          ! grep -RInE '(REDIS_PASSWORD=|redis://[^[:space:]@]+:[^[:space:]@]+@)' . --exclude-dir=.git
