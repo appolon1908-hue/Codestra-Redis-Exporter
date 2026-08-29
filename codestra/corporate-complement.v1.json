@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0",
+  "component": "redis-exporter",
+  "codestraRole": "redis health metrics authority",
+  "corporatePurpose": "Expose Redis memory, latency, persistence, replication, clients and safe aggregate keyspace health without leaking key names.",
+  "businessPortfolio": ["codestra", "moneybee", "beyvra", "breero", "larim-a", "transportation", "booked4seasons", "social", "klyrow", "telnexa", "kyqra", "restaurant", "provisioning"],
+  "standardDimensions": ["codestra_business", "application", "service", "environment", "server", "region", "deployment"],
+  "forbiddenLabels": ["tenant_id", "customer_id", "user_id", "email", "phone", "request_id", "trace_id", "message_id", "financial_transaction_id", "redis_key"],
+  "corporateFeatures": ["memory_fragmentation", "client_pressure", "latency_monitoring", "replication_health", "persistence_health", "eviction_tracking", "safe_keyspace_aggregates", "queue_backlog_inputs"],
+  "dashboardContribution": ["redis_capacity", "cache_health", "queue_storage_health", "eviction_risk"],
+  "beyvraBoundary": "Redis metrics must not expose trading session keys, account IDs, order IDs or raw key names.",
+  "activationStatus": "SOURCE_PREPARED_NOT_DEPLOYED"
+}
