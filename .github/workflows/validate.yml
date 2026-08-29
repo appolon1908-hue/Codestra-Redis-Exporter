@@ -14,6 +14,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
       - name: Render and inspect compose authority
         env:
           REDIS_EXPORTER_IMAGE: example.invalid/redis-exporter@sha256:0000000000000000000000000000000000000000000000000000000000000000
@@ -47,12 +49,16 @@ jobs:
           assert config['networks']['observability']['external'] is True
           assert config['networks']['cache']['external'] is True
           PY
-      - name: Reject mutable images and inline credentials
+      - name: Reject mutable images and Codestra-owned inline credentials
         run: |
           set -euo pipefail
           ! grep -RInE 'image:.*(:latest|:[[:space:]]*$)' deploy
           ! grep -RInE \
             --exclude-dir=.git \
             --exclude-dir=.github \
+            --exclude-dir=upstream \
             '(REDIS_PASSWORD=|redis://[^[:space:]@]+:[^[:space:]@]+@)' \
             .
+          # Upstream test fixtures are immutable provenance and are not runtime configuration.
+          ! grep -RInE '(REDIS_PASSWORD=|redis://[^[:space:]@]+:[^[:space:]@]+@)' \
+            .env.example deploy codestra docs README.md 2>/dev/null
