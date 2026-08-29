@@ -1,0 +1,50 @@
+name: codestra-redis-exporter
+
+services:
+  redis-exporter:
+    image: ${REDIS_EXPORTER_IMAGE:?REDIS_EXPORTER_IMAGE must be an immutable image reference containing @sha256:}
+    restart: unless-stopped
+    user: "65534:65534"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    stop_grace_period: 15s
+    environment:
+      REDIS_ADDR: ${REDIS_ADDR:-redis://redis:6379}
+      REDIS_USER: ${REDIS_EXPORTER_USER:-codestra_exporter}
+      REDIS_PASSWORD_FILE: /run/secrets/redis_exporter_password
+      REDIS_EXPORTER_WEB_LISTEN_ADDRESS: :9121
+      REDIS_EXPORTER_WEB_TELEMETRY_PATH: /metrics
+      REDIS_EXPORTER_DISABLE_SCRAPE_ENDPOINT: "true"
+      REDIS_EXPORTER_EXPORT_CLIENT_PORT: "false"
+      REDIS_EXPORTER_CONFIG_COMMAND: "-"
+      REDIS_EXPORTER_LOG_FORMAT: json
+      REDIS_EXPORTER_LOG_LEVEL: info
+      REDIS_EXPORTER_CONNECTION_TIMEOUT: 5s
+    expose:
+      - "9121"
+    secrets:
+      - redis_exporter_password
+    networks:
+      observability:
+        aliases:
+          - redis-exporter
+      cache: {}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+
+networks:
+  observability:
+    external: true
+    name: ${CODESTRA_OBSERVABILITY_NETWORK:-codestra-observability}
+  cache:
+    external: true
+    name: ${CODESTRA_CACHE_NETWORK:-codestra-cache}
+
+secrets:
+  redis_exporter_password:
+    external: true
+    name: ${REDIS_EXPORTER_PASSWORD_SECRET:-codestra-redis-exporter-password}
