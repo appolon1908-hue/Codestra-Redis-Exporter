@@ -50,4 +50,5 @@ jobs:
           git add -A upstream CODESTRA_UPSTREAM_LOCK.json
           git diff --cached --quiet && exit 0
           git commit -m "vendor: sync official Redis Exporter upstream ${UPSTREAM_SHA}"
+          git pull --rebase origin main
           git push origin HEAD:main
