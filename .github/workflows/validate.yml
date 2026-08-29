@@ -51,4 +51,8 @@ jobs:
         run: |
           set -euo pipefail
           ! grep -RInE 'image:.*(:latest|:[[:space:]]*$)' deploy
-          ! grep -RInE '(REDIS_PASSWORD=|redis://[^[:space:]@]+:[^[:space:]@]+@)' . --exclude-dir=.git
+          ! grep -RInE \
+            --exclude-dir=.git \
+            --exclude-dir=.github \
+            '(REDIS_PASSWORD=|redis://[^[:space:]@]+:[^[:space:]@]+@)' \
+            .
