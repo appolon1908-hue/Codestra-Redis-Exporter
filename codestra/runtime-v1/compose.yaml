@@ -1,0 +1,53 @@
+name: codestra-redis-exporter
+
+services:
+  redis-exporter:
+    image: ${REDIS_EXPORTER_IMAGE:?REDIS_EXPORTER_IMAGE must be an immutable image digest}
+    restart: unless-stopped
+    user: "59000:59000"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - --redis.addr=${REDIS_ADDR:?set a private redis or rediss address without credentials}
+      - --redis.user=${REDIS_MONITOR_USER:-codestra_monitor}
+      - --redis.password-file=/run/secrets/redis_monitor_password
+      - --web.listen-address=0.0.0.0:9121
+      - --web.telemetry-path=/metrics
+      - --namespace=redis
+    labels:
+      com.codestra.business: ${CODESTRA_BUSINESS:?use an approved business slug}
+      com.codestra.application: ${CODESTRA_APPLICATION:?set application}
+      com.codestra.service: redis-exporter
+      com.codestra.environment: ${CODESTRA_ENVIRONMENT:?set environment}
+      com.codestra.deployment: ${CODESTRA_DEPLOYMENT:?set immutable deployment identifier}
+      com.codestra.owner: platform-observability
+    secrets:
+      - redis_monitor_password
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    networks:
+      - codestra_data
+      - codestra_observability
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
+
+secrets:
+  redis_monitor_password:
+    file: ${REDIS_MONITOR_PASSWORD_FILE:?mount an OpenBao-rendered Redis ACL password file}
+
+networks:
+  codestra_data:
+    external: true
+    name: codestra-data
+  codestra_observability:
+    external: true
+    name: codestra-observability
