@@ -12,22 +12,32 @@ services:
       - no-new-privileges:true
     pids_limit: 128
     stop_grace_period: 15s
+    command:
+      - --redis.addr=${REDIS_ADDR:-redis://redis:6379}
+      - --redis.user=${REDIS_EXPORTER_USER:-codestra_exporter}
+      - --redis.password-file=/run/secrets/redis_password_map.json
+      - --web.listen-address=:9121
+      - --web.telemetry-path=/metrics
+      - --disable-scrape-endpoint
+      - --export-client-list=false
+      - --export-client-port=false
+      - --config-command=-
+      - --log-format=json
+      - --log-level=info
+      - --connection-timeout=5s
+      - --skip-tls-verification=false
+      - --disable-exporting-key-values=true
     environment:
       REDIS_ADDR: ${REDIS_ADDR:-redis://redis:6379}
       REDIS_USER: ${REDIS_EXPORTER_USER:-codestra_exporter}
-      REDIS_PASSWORD_FILE: /run/secrets/redis_exporter_password
-      REDIS_EXPORTER_WEB_LISTEN_ADDRESS: :9121
-      REDIS_EXPORTER_WEB_TELEMETRY_PATH: /metrics
-      REDIS_EXPORTER_DISABLE_SCRAPE_ENDPOINT: "true"
-      REDIS_EXPORTER_EXPORT_CLIENT_PORT: "false"
-      REDIS_EXPORTER_CONFIG_COMMAND: "-"
-      REDIS_EXPORTER_LOG_FORMAT: json
-      REDIS_EXPORTER_LOG_LEVEL: info
-      REDIS_EXPORTER_CONNECTION_TIMEOUT: 5s
     expose:
       - "9121"
     secrets:
-      - redis_exporter_password
+      - source: redis_exporter_password_map
+        target: redis_password_map.json
+        uid: "65534"
+        gid: "65534"
+        mode: 0400
     networks:
       observability:
         aliases:
@@ -45,6 +55,6 @@ networks:
     name: ${CODESTRA_CACHE_NETWORK:-codestra-cache}
 
 secrets:
-  redis_exporter_password:
+  redis_exporter_password_map:
     external: true
-    name: ${REDIS_EXPORTER_PASSWORD_SECRET:-codestra-redis-exporter-password}
+    name: ${REDIS_EXPORTER_PASSWORD_MAP_SECRET:-codestra-redis-exporter-password-map}

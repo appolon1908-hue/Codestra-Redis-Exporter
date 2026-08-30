@@ -4,9 +4,41 @@ This repository is the service authority for Redis availability, memory, persist
 
 ## Least-privilege runtime
 
-The exporter runs as UID/GID 65534 with a read-only filesystem, no Linux capabilities, `no-new-privileges`, and no host port. It joins only the private observability and cache networks. Prometheus reaches `redis-exporter:9121/metrics`; `rdex.codestra.media` is an ownership/DNS identifier and does not authorize a public endpoint, Caddy/Kong route, or Docker `ports:` mapping.
+The exporter runs as a non-root user with a read-only filesystem, no Linux capabilities, `no-new-privileges`, and no host port. It joins only the private observability and cache networks. Prometheus reaches `redis-exporter:9121/metrics`; `rdex.codestra.media` is an ownership/DNS identifier and does not authorize a public endpoint, Caddy/Kong route, or Docker `ports:` mapping.
 
-Redis authentication uses a dedicated monitoring ACL user and an external secret mounted at `/run/secrets/redis_exporter_password`. Passwords must not appear in `REDIS_ADDR`, `.env`, Compose, GitHub Actions, logs, or Prometheus labels. The exporter disables the multi-target `/scrape` endpoint, omits client ports, and skips the Redis `CONFIG` command by default.
+One exporter process owns exactly one deployment-controlled `REDIS_ADDR`. Both runtime candidates pass `--disable-scrape-endpoint`, so clients cannot select an arbitrary Redis target or inject `check-keys`, `check-single-keys`, streams, or count-key scans through `/scrape` query parameters. The runtime also disables key-value export, client-list export, client-port labels, the Redis `CONFIG` command, and TLS verification bypass.
+
+## Password-map contract
+
+The exact upstream exporter does **not** accept a raw password in `--redis.password-file`. It parses that file as a JSON object and looks up the normalized target URI, including the configured Redis ACL user.
+
+For:
+
+```text
+REDIS_ADDR=rediss://redis.internal:6379
+REDIS_MONITOR_USER=codestra_monitor
+```
+
+OpenBao must render the external secret as:
+
+```json
+{
+  "rediss://codestra_monitor@redis.internal:6379": "INJECT_FROM_OPENBAO"
+}
+```
+
+The runtime secret must contain exactly one target and one non-empty password. It may not contain a raw scalar password, additional targets, credentials embedded in `REDIS_ADDR`, line breaks, or an unapproved URI. The secret is mounted read-only at `/run/secrets/redis_password_map.json`; it is never copied into environment variables, Git, logs, metrics, or CI output.
+
+Before any approved runtime action, validate the exact rendered password-map file:
+
+```bash
+python3 scripts/validate_runtime_password_map.py \
+  --password-map /run/codestra/redis-exporter-password-map.json \
+  --redis-addr "$REDIS_ADDR" \
+  --redis-user "$REDIS_MONITOR_USER"
+```
+
+## Redis ACL
 
 The monitoring ACL must permit only the commands required by the reviewed exporter version for connection health and read-only server statistics. It must not permit writes, scripting, module administration, replication administration, ACL changes, key reads, key scans, or destructive commands.
 
@@ -18,21 +50,20 @@ See `codestra/enterprise-profile.v1.json` and `codestra/docs/CORPORATE-FEATURES.
 
 ## Validation
 
-Repository CI renders `deploy/compose.yaml`, proves immutable-image enforcement, non-root/read-only/capability-free operation, external secret use, private networks, disabled multi-target scraping and `CONFIG`, no inline credential, and no public port publication.
+Repository CI:
 
-A future approved deployment may use:
+- builds and tests the exact locked upstream source;
+- proves `--disable-scrape-endpoint` and `--redis.password-file` support;
+- re-runs whenever upstream source, submodule metadata, or source-lock files change;
+- renders both runtime candidates;
+- proves non-root/read-only/capability-free operation, private networks, and no public port publication;
+- validates the one-target JSON password map and rejects raw or multi-target files;
+- rejects inline credentials and mutable image examples.
 
-```bash
-cp .env.example .env
-# Set an accepted image digest and provision the external runtime secret.
-docker compose -f deploy/compose.yaml config
-docker compose -f deploy/compose.yaml up -d
-# From the private observability network:
-curl --fail http://redis-exporter:9121/metrics
-```
+A future approved deployment may render the candidate only after the exact image, target, ACL, password map, private networks, and rollback packet are reviewed. No `docker compose up`, Redis ACL mutation, secret installation, or Prometheus target activation is authorized by this repository work.
 
-Those commands are documentation only during the repository-first phase. Before target activation, later evidence must prove `redis_up == 1`, private-only reachability, no `/scrape` endpoint, no inline credential, bounded samples, required labels, ACL denial of prohibited commands, and rollback.
+Before Prometheus target activation, later staging evidence must prove `redis_up == 1`, private-only reachability, `/scrape` returns not found, no inline credential, bounded samples, required labels, ACL denial of prohibited commands, password-map rotation, and rollback.
 
 ## Promotion and safety
 
-Promotion is `feature/* -> development -> test -> staging -> production -> main`. Merging changes source authority only and does not deploy. `DEPLOYMENT_ENABLED=NO` remains binding until the 14-repository release manifest is accepted.
+Promotion is `feature/* -> development -> test -> staging -> production -> main`. Merging changes source authority only and does not deploy. `DEPLOYMENT_ENABLED=NO` remains binding until the corporate-suite source and staging reviews are separately accepted.
