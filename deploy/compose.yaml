@@ -19,6 +19,7 @@ services:
       - --web.listen-address=:9121
       - --web.telemetry-path=/metrics
       - --disable-scrape-endpoint
+      - --export-client-list=false
       - --export-client-port=false
       - --config-command=-
       - --log-format=json

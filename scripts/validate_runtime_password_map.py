@@ -88,6 +88,7 @@ def validate_compose(path: pathlib.Path) -> None:
     required = (
         "--disable-scrape-endpoint",
         f"--redis.password-file={PASSWORD_PATH}",
+        "--export-client-list=false",
     )
     for fragment in required:
         if fragment not in text:
@@ -98,7 +99,7 @@ def validate_compose(path: pathlib.Path) -> None:
         "--check-keys",
         "--check-single-keys",
         "--count-keys",
-        "--export-client-list",
+        "--export-client-list=true",
     )
     for fragment in forbidden:
         if fragment in text:
