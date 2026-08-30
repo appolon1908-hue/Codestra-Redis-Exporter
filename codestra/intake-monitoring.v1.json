@@ -1,0 +1,24 @@
+{
+  "schemaVersion": "1.0",
+  "status": "CONTRACT_PREPARED_NOT_DEPLOYED",
+  "domain": "unified-intake",
+  "canonicalFlow": ["website-or-widget", "@codestra/intake-form-or-intake-survey", "@codestra/intake-sdk", "same-origin-intake-bff", "caddy", "kong", "middleware-durable-intake", "odoo-or-analytics-or-approved-workflow"],
+  "events": ["codestra.events.lead_submitted", "codestra.events.survey_response_submitted"],
+  "safeDimensions": ["codestra_business", "application", "service", "environment", "server", "region", "deployment", "redis_role"],
+  "forbiddenLabelsOrPayloads": ["tenant_id", "site_id", "campaign_id", "form_id", "survey_id", "question_id", "customer_id", "contact_id", "lead_id", "response_id", "email", "phone", "message", "transcript", "answers", "custom_fields", "consent_text", "redis_key", "redis_value"],
+  "privacyRules": {
+    "rawFormAnswersInTelemetry": false,
+    "rawSurveyAnswersInTelemetry": false,
+    "rawKeysOrValuesExported": false
+  },
+  "activation": {"runtimeApplied": false, "productionTargetsEnabled": false, "liveBusinessWritesEnabledByThisContract": false},
+  "component": "redis-exporter",
+  "responsibility": "aggregate Redis health for intake idempotency, rate-limit and queue roles",
+  "features": {
+    "approvedRoles": ["intake-idempotency", "intake-rate-limit", "intake-inbox", "intake-outbox", "intake-worker-queue"],
+    "signals": ["availability", "clients", "blocked-clients", "memory", "evictions", "latency", "persistence", "replication"],
+    "keyScanning": false,
+    "singleKeyInspection": false,
+    "rawKeysOrValuesExported": false
+  }
+}
