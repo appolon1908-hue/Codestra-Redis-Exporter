@@ -1,0 +1,84 @@
+name: Validate Codestra Redis Exporter runtime v1
+
+on:
+  pull_request:
+    paths:
+      - "codestra/runtime-v1/**"
+      - ".github/workflows/validate-codestra-runtime-v1.yml"
+  push:
+    branches:
+      - development
+      - test
+      - staging
+      - production
+      - main
+    paths:
+      - "codestra/runtime-v1/**"
+      - ".github/workflows/validate-codestra-runtime-v1.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream/go.mod
+          cache-dependency-path: upstream/go.sum
+      - name: Build the vendored upstream exporter
+        working-directory: upstream
+        run: go build -trimpath -o ../.tmp-redis-exporter .
+      - name: Prove password-file support from the exact source snapshot
+        run: |
+          ./.tmp-redis-exporter --help 2>&1 | grep -Eq -- '(^|[[:space:]])-{1,2}redis\.password-file([[:space:]]|$)'
+          grep -q 'REDIS_PASSWORD_FILE' upstream/main.go
+      - name: Install pinned YAML parser
+        run: python -m pip install --disable-pip-version-check PyYAML==6.0.2
+      - name: Validate security and metric contracts
+        shell: python
+        run: |
+          from pathlib import Path
+          import json
+          import yaml
+
+          root = Path("codestra/runtime-v1")
+          text = (root / "compose.yaml").read_text()
+          compose = yaml.safe_load(text)
+          contract = json.loads((root / "metrics-contract.json").read_text())
+          service = compose["services"]["redis-exporter"]
+          commands = service["command"]
+          joined = "\n".join(commands)
+
+          assert "ports" not in service
+          assert service["read_only"] is True
+          assert "ALL" in service["cap_drop"]
+          assert "--redis.password-file=/run/secrets/redis_monitor_password" in commands
+          assert "--check-keys" not in joined
+          assert "--check-single-keys" not in joined
+          assert "--count-keys" not in joined
+          assert "--export-client-list" not in joined
+          assert "@${" not in joined and "redis://:" not in joined
+          assert contract["rules"]["multiTargetScrapeEndpointExposed"] is False
+          assert contract["rules"]["keyPatternScanningEnabled"] is False
+          assert contract["rules"]["clientListExportEnabled"] is False
+          assert contract["rules"]["monitoringAclIsReadOnly"] is True
+          assert "latest" not in text.lower()
+          print("Codestra Redis Exporter runtime validation PASS")
+      - name: Render Compose with non-secret CI values
+        env:
+          REDIS_EXPORTER_IMAGE: oliver006/redis_exporter:ci@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          REDIS_ADDR: rediss://redis.internal:6379
+          REDIS_MONITOR_USER: codestra_monitor
+          REDIS_MONITOR_PASSWORD_FILE: /tmp/codestra-redis-exporter-password
+          CODESTRA_BUSINESS: platform
+          CODESTRA_APPLICATION: shared-cache
+          CODESTRA_ENVIRONMENT: test
+          CODESTRA_DEPLOYMENT: exact-head-ci
+        run: |
+          printf 'non-secret-ci-placeholder\n' > "$REDIS_MONITOR_PASSWORD_FILE"
+          docker compose -f codestra/runtime-v1/compose.yaml config >/tmp/codestra-redis-exporter-runtime.yaml
+          test -s /tmp/codestra-redis-exporter-runtime.yaml
+          ! grep -Eq ':latest([[:space:]]|$)|published:|host_ip:|redis://:[^[:space:]]' /tmp/codestra-redis-exporter-runtime.yaml

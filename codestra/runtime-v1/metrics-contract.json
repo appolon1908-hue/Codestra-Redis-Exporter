@@ -1,0 +1,70 @@
+{
+  "schemaVersion": "1.0",
+  "mode": "one_exporter_per_approved_redis_instance",
+  "endpoint": "http://redis-exporter:9121/metrics",
+  "requiredTargetLabels": [
+    "codestra_business",
+    "application",
+    "service",
+    "environment",
+    "server",
+    "region",
+    "deployment",
+    "redis_role",
+    "redis_instance"
+  ],
+  "approvedRedisRoles": [
+    "cache",
+    "queue",
+    "session",
+    "rate-limit",
+    "workflow",
+    "realtime"
+  ],
+  "corporateMetrics": [
+    "redis_up",
+    "redis_connected_clients",
+    "redis_blocked_clients",
+    "redis_memory_used_bytes",
+    "redis_memory_max_bytes",
+    "redis_mem_fragmentation_ratio",
+    "redis_evicted_keys_total",
+    "redis_expired_keys_total",
+    "redis_keyspace_hits_total",
+    "redis_keyspace_misses_total",
+    "redis_commands_processed_total",
+    "redis_commands_duration_seconds_total",
+    "redis_rejected_connections_total",
+    "redis_connected_slaves",
+    "redis_master_repl_offset",
+    "redis_slave_repl_offset",
+    "redis_rdb_last_save_timestamp_seconds",
+    "redis_rdb_changes_since_last_save",
+    "redis_aof_last_rewrite_duration_sec",
+    "redis_instance_info"
+  ],
+  "forbiddenMetricLabels": [
+    "redis_key",
+    "key_name",
+    "tenant_id",
+    "customer_id",
+    "email",
+    "phone",
+    "request_id",
+    "trace_id",
+    "session_id",
+    "message_id",
+    "order_id"
+  ],
+  "rules": {
+    "multiTargetScrapeEndpointExposed": false,
+    "keyPatternScanningEnabled": false,
+    "singleKeyInspectionEnabled": false,
+    "clientListExportEnabled": false,
+    "credentialsInTargetUri": false,
+    "credentialsInGit": false,
+    "monitoringAclIsReadOnly": true,
+    "databaseNumberMayBeLabel": true,
+    "rawKeyNameMayBeLabel": false
+  }
+}
