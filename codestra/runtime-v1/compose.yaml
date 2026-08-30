@@ -11,12 +11,18 @@ services:
     security_opt:
       - no-new-privileges:true
     command:
-      - --redis.addr=${REDIS_ADDR:?set a private redis or rediss address without credentials}
+      - --redis.addr=${REDIS_ADDR:?set one private redis or rediss address without credentials}
       - --redis.user=${REDIS_MONITOR_USER:-codestra_monitor}
-      - --redis.password-file=/run/secrets/redis_monitor_password
+      - --redis.password-file=/run/secrets/redis_password_map.json
       - --web.listen-address=0.0.0.0:9121
       - --web.telemetry-path=/metrics
+      - --disable-scrape-endpoint
       - --namespace=redis
+      - --config-command=-
+      - --export-client-list=false
+      - --export-client-port=false
+      - --disable-exporting-key-values=true
+      - --skip-tls-verification=false
     labels:
       com.codestra.business: ${CODESTRA_BUSINESS:?use an approved business slug}
       com.codestra.application: ${CODESTRA_APPLICATION:?set application}
@@ -25,7 +31,11 @@ services:
       com.codestra.deployment: ${CODESTRA_DEPLOYMENT:?set immutable deployment identifier}
       com.codestra.owner: platform-observability
     secrets:
-      - redis_monitor_password
+      - source: redis_monitor_password_map
+        target: redis_password_map.json
+        uid: "59000"
+        gid: "59000"
+        mode: 0400
     tmpfs:
       - /tmp:size=16m,mode=1777
     networks:
@@ -41,8 +51,8 @@ services:
           memory: 64M
 
 secrets:
-  redis_monitor_password:
-    file: ${REDIS_MONITOR_PASSWORD_FILE:?mount an OpenBao-rendered Redis ACL password file}
+  redis_monitor_password_map:
+    file: ${REDIS_MONITOR_PASSWORD_MAP_FILE:?mount an OpenBao-rendered one-target JSON password map}
 
 networks:
   codestra_data:
