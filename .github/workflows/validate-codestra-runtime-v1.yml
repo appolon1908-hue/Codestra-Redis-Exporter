@@ -44,9 +44,13 @@ jobs:
           go-version-file: upstream/go.mod
           cache-dependency-path: upstream/go.sum
 
-      - name: Build the exact upstream exporter
-        working-directory: upstream
-        run: go build -trimpath -o ../.tmp-redis-exporter .
+      - name: Build and test the exact upstream exporter
+        run: |
+          set -euo pipefail
+          cd upstream
+          go build -trimpath -o ../.tmp-redis-exporter .
+          go test ./exporter -run 'Test.*PwdFile|TestLoadPwdFile' -count=1
+          cd ..
 
       - name: Prove password-map and scrape-disable support from exact source
         run: |
@@ -54,7 +58,6 @@ jobs:
           ./.tmp-redis-exporter --help 2>&1 | grep -Eq -- '(^|[[:space:]])-{1,2}disable-scrape-endpoint([[:space:]]|$)'
           grep -q 'REDIS_PASSWORD_FILE' upstream/main.go
           grep -q 'json.Unmarshal' upstream/exporter/pwd_file.go
-          go test ./upstream/exporter -run 'Test.*PwdFile|TestLoadPwdFile' -count=1
 
       - name: Install pinned YAML parser
         run: python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3
