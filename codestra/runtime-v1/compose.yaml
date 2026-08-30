@@ -1,0 +1,63 @@
+name: codestra-redis-exporter
+
+services:
+  redis-exporter:
+    image: ${REDIS_EXPORTER_IMAGE:?REDIS_EXPORTER_IMAGE must be an immutable image digest}
+    restart: unless-stopped
+    user: "59000:59000"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - --redis.addr=${REDIS_ADDR:?set one private redis or rediss address without credentials}
+      - --redis.user=${REDIS_MONITOR_USER:-codestra_monitor}
+      - --redis.password-file=/run/secrets/redis_password_map.json
+      - --web.listen-address=0.0.0.0:9121
+      - --web.telemetry-path=/metrics
+      - --disable-scrape-endpoint
+      - --namespace=redis
+      - --config-command=-
+      - --export-client-list=false
+      - --export-client-port=false
+      - --disable-exporting-key-values=true
+      - --skip-tls-verification=false
+    labels:
+      com.codestra.business: ${CODESTRA_BUSINESS:?use an approved business slug}
+      com.codestra.application: ${CODESTRA_APPLICATION:?set application}
+      com.codestra.service: redis-exporter
+      com.codestra.environment: ${CODESTRA_ENVIRONMENT:?set environment}
+      com.codestra.deployment: ${CODESTRA_DEPLOYMENT:?set immutable deployment identifier}
+      com.codestra.owner: platform-observability
+    secrets:
+      - source: redis_monitor_password_map
+        target: redis_password_map.json
+        uid: "59000"
+        gid: "59000"
+        mode: 0400
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    networks:
+      - codestra_data
+      - codestra_observability
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
+
+secrets:
+  redis_monitor_password_map:
+    file: ${REDIS_MONITOR_PASSWORD_MAP_FILE:?mount an OpenBao-rendered one-target JSON password map}
+
+networks:
+  codestra_data:
+    external: true
+    name: codestra-data
+  codestra_observability:
+    external: true
+    name: codestra-observability

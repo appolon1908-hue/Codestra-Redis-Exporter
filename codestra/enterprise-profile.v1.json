@@ -1,0 +1,32 @@
+{
+  "schemaVersion": "1.0",
+  "component": "redis-exporter",
+  "role": "redis-health-metrics-exporter",
+  "canonicalHostname": "rdex.codestra.media",
+  "exposure": "internal_private",
+  "status": "SOURCE_PREPARED_NOT_DEPLOYED",
+  "businessScope": ["codestra", "moneybee", "beyvra", "breero", "larim-a", "transportation", "booked4seasons", "social", "klyrow", "telnexa", "kyqra", "restaurant", "provisioning"],
+  "metricScope": ["memory", "clients", "blocked_clients", "commands", "keyspace_aggregate", "expirations", "evictions", "replication", "persistence", "latency", "errors"],
+  "features": {
+    "multiInstanceMonitoring": true,
+    "memoryPressureAlerts": true,
+    "evictionAlerts": true,
+    "replicationHealth": true,
+    "persistenceHealth": true,
+    "blockedClientDetection": true,
+    "latencyMonitoring": true,
+    "aggregateKeyspaceGrowth": true,
+    "queueBacklogCorrelation": true
+  },
+  "privacy": {
+    "exportKeyValues": false,
+    "exportBusinessPayloads": false,
+    "exportCustomerIdentifiers": false
+  },
+  "security": {
+    "publicNativePortAllowed": false,
+    "prometheusPrivateScrapeOnly": true,
+    "credentialsFromOpenBaoOrSecretFiles": true,
+    "secretMaterialInGit": false
+  }
+}
