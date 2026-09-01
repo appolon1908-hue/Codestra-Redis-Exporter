@@ -12,7 +12,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-SYNC_WORKFLOW_SHA256 = "10c70f0710c22e97cc1ac0530d2beb181b121fdf175acca6120d457fbe4bf138"
+SYNC_WORKFLOW_SHA256 = "259eae301dce4756e9ce7924d44ffdb148ffcfd0bbab4e912afba6bb821d470e"
 
 
 def logical_shell_lines(source: str) -> tuple[str, ...]:
@@ -63,7 +63,7 @@ def reject_protected_pushes(source: str) -> None:
                 raise ValueError("protected_branch_sync_forbidden:dynamic_command")
         segments: list[list[str]] = [[]]
         for word in words:
-            if word and set(word) <= set("();&|"):
+            if word in {"{", "}"} or (word and set(word) <= set("();&|")):
                 segments.append([])
             else:
                 segments[-1].append(word)
@@ -83,6 +83,21 @@ def reject_protected_pushes(source: str) -> None:
             command_index = index + 1
             while command_index < len(words) and words[command_index].startswith("-"):
                 option = words[command_index]
+                if option == "-c":
+                    if command_index + 1 >= len(words):
+                        raise ValueError("sync_shell_parse_failed")
+                    config = words[command_index + 1]
+                    if (
+                        config.lower().startswith("alias.")
+                        or "$" in config
+                    ):
+                        raise ValueError(
+                            "protected_branch_sync_forbidden:dynamic_command"
+                        )
+                if option.lower().startswith(("-calias.", "--config-env=alias.")):
+                    raise ValueError(
+                        "protected_branch_sync_forbidden:dynamic_command"
+                    )
                 command_index += 2 if option in {
                     "-c", "-C", "--git-dir", "--work-tree"
                 } else 1
@@ -178,7 +193,9 @@ def validate_sync(source: str, document: dict) -> None:
         "gh pr list",
         "Multiple open synchronization pull requests found.",
         "gh pr create",
-        "--base main",
+        "--base development",
+        "--base development --head",
+        "github.ref == 'refs/heads/development'",
         'gh workflow run validate.yml --repo "$GITHUB_REPOSITORY" --ref "$SYNC_BRANCH"',
         "'synchronized_at': os.environ['UPSTREAM_TIMESTAMP']",
         'export GIT_AUTHOR_DATE="$UPSTREAM_TIMESTAMP"',

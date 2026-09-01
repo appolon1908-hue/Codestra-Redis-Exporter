@@ -106,6 +106,12 @@ class RepositorySecurityTests(unittest.TestCase):
             safe + '\n          G=git; "$G" push origin HEAD:refs/heads/main',
             safe + '\n          verb=push; git "$verb" origin HEAD:refs/heads/main',
             safe + '\n          suffix=; git p${suffix}ush origin HEAD:refs/heads/main',
+            safe
+            + '\n          G=/usr/bin/git; P=pu; P+=sh; { "$G" "$P" origin HEAD:refs/heads/main; }',
+            safe
+            + '\n          git -c alias.x=push x origin HEAD:refs/heads/main',
+            safe
+            + '\n          git -calias.x=push x origin HEAD:refs/heads/main',
         ):
             with self.subTest(command=command):
                 unsafe = self.sync_source.replace(safe, command)
@@ -130,6 +136,24 @@ class RepositorySecurityTests(unittest.TestCase):
             'gh workflow run validate.yml --repo "$GITHUB_REPOSITORY" --ref "$SYNC_BRANCH"',
             self.sync_source,
         )
+
+    def test_sync_targets_the_first_promotion_branch(self) -> None:
+        triggers = self.sync_document.get("on") or self.sync_document.get(True)
+        self.assertEqual(triggers["push"]["branches"], ["development"])
+        self.assertEqual(
+            self.sync_document["jobs"]["sync"]["if"],
+            "github.actor != 'github-actions[bot]' && github.ref == 'refs/heads/development'",
+        )
+        self.assertIn("--base development", self.sync_source)
+        self.assertNotIn("--base main", self.sync_source)
+        for removed in (
+            " && github.ref == 'refs/heads/development'",
+            "--base development",
+        ):
+            with self.subTest(removed=removed):
+                unsafe = self.sync_source.replace(removed, "", 1)
+                with self.assertRaisesRegex(ValueError, "reviewed_sync_boundary_missing"):
+                    VALIDATOR.validate_sync(unsafe, yaml.safe_load(unsafe))
 
     def test_vendored_tree_is_bound_to_fresh_official_commit(self) -> None:
         source = (ROOT / ".github/workflows/validate.yml").read_text()

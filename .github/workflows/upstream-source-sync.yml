@@ -2,7 +2,7 @@ name: Codestra Upstream Source Sync
 
 on:
   push:
-    branches: [main]
+    branches: [development]
     paths:
       - CODESTRA_UPSTREAM.json
       - .github/workflows/upstream-source-sync.yml
@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   sync:
-    if: github.actor != 'github-actions[bot]'
+    if: github.actor != 'github-actions[bot]' && github.ref == 'refs/heads/development'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -131,7 +131,7 @@ jobs:
 
           mapfile -t OPEN_PRS < <(
             gh pr list --repo "$GITHUB_REPOSITORY" --state open \
-              --head "$SYNC_BRANCH" --json number --jq '.[].number'
+              --base development --head "$SYNC_BRANCH" --json number --jq '.[].number'
           )
           if (( ${#OPEN_PRS[@]} > 1 )); then
             echo 'Multiple open synchronization pull requests found.' >&2
@@ -139,7 +139,7 @@ jobs:
           elif (( ${#OPEN_PRS[@]} == 0 )); then
             gh pr create \
               --repo "$GITHUB_REPOSITORY" \
-              --base main \
+              --base development \
               --head "$SYNC_BRANCH" \
               --title "vendor(redis-exporter): Sync reviewed official upstream ${UPSTREAM_SHA}" \
               --body "Pins and imports exact official Redis Exporter commit ${UPSTREAM_SHA}. Deployment remains disabled. Normal source validation and independent review are required."
