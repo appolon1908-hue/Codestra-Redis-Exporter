@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
   "upstream_clone_url": "https://github.com/oliver006/redis_exporter.git",
-  "upstream_ref": "master",
+  "upstream_ref": "072bd8bdabb60de075206fbebc9698edb1fff8f1",
   "upstream_commit": "072bd8bdabb60de075206fbebc9698edb1fff8f1",
   "import_path": "upstream",
   "synchronized_at": "2026-08-29T18:18:23.884343+00:00",
