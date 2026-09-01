@@ -5,11 +5,104 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from pathlib import Path
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def logical_shell_lines(source: str) -> tuple[str, ...]:
+    result: list[str] = []
+    pending = ""
+    for raw in source.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        pending += line
+        trailing = len(pending) - len(pending.rstrip("\\"))
+        if trailing % 2 == 1:
+            pending = pending[:-1]
+            continue
+        result.append(pending)
+        pending = ""
+    if pending:
+        result.append(pending)
+    return tuple(result)
+
+
+def reject_protected_pushes(source: str) -> None:
+    protected = {"main", "staging", "production"}
+    separators = {";", "&&", "||", "|", "&", "(", ")", "<", ">"}
+    for line in logical_shell_lines(source):
+        probe = re.sub(r"\\([^\n])", r"\1", line)
+        if re.search(r"\bgit\b.*\bpush\b", probe) is None:
+            continue
+        try:
+            lexer = shlex.shlex(line, posix=True, punctuation_chars="();&|<>")
+            lexer.whitespace_split = True
+            lexer.commenters = "#"
+            words = list(lexer)
+        except ValueError as error:
+            raise ValueError("sync_shell_parse_failed") from error
+        for index, word in enumerate(words):
+            if Path(word).name != "git":
+                continue
+            command_index = index + 1
+            while command_index < len(words) and words[command_index].startswith("-"):
+                option = words[command_index]
+                command_index += 2 if option in {
+                    "-c",
+                    "-C",
+                    "--git-dir",
+                    "--work-tree",
+                } else 1
+            if command_index >= len(words) or words[command_index] != "push":
+                continue
+            for candidate in words[command_index + 1 :]:
+                if candidate in separators:
+                    break
+                if candidate in {
+                    "--all",
+                    "--branches",
+                    "--force",
+                    "--force-with-lease",
+                    "--mirror",
+                    "-f",
+                } or candidate.startswith(("--force=", "--force-with-lease=")):
+                    raise ValueError("protected_branch_sync_forbidden")
+                refspec = candidate.lstrip("+")
+                if refspec == "HEAD:refs/heads/${SYNC_BRANCH}":
+                    continue
+                if "$" in refspec or "`" in refspec or any(
+                    marker in refspec for marker in ("*", "?", "[")
+                ):
+                    raise ValueError("protected_branch_sync_forbidden")
+                destination = refspec.rsplit(":", 1)[-1].removeprefix("refs/heads/")
+                if destination in protected:
+                    raise ValueError("protected_branch_sync_forbidden")
+
+
+def validate_sync_branch_authority(source: str) -> None:
+    expected = 'readonly SYNC_BRANCH="sync/redis-exporter-upstream-${UPSTREAM_SHA}"'
+    lines = logical_shell_lines(source)
+    if lines.count(expected) != 1:
+        raise ValueError("sync_branch_authority_invalid")
+    for line in lines:
+        if line == expected:
+            continue
+        probe = re.sub(r"\\([^\n])", r"\1", line)
+        if re.search(r"(?:^|[();&|<>\s])SYNC_BRANCH\s*=", probe):
+            raise ValueError("sync_branch_authority_invalid")
+        if re.search(
+            r"\b(?:unset|read|mapfile|declare|typeset|local|export|readonly|printf)\b"
+            r"[^\n]*\bSYNC_BRANCH\b",
+            probe,
+        ):
+            raise ValueError("sync_branch_authority_invalid")
+
+
 def validate_upstream(source: dict, lock: dict) -> None:
     expected = {
         "component": "Redis Exporter",
@@ -45,18 +138,19 @@ def validate_sync(source: str, document: dict) -> None:
         "pull-requests": "write",
     }:
         raise ValueError("sync_permissions_drift")
-    forbidden = (
-        r"git\s+push\s+origin\s+(?:HEAD:)?(?:main|staging|production)(?:\s|$)",
-        r"git\s+push\s+--force",
-    )
-    if any(re.search(pattern, source) for pattern in forbidden):
-        raise ValueError("protected_branch_sync_forbidden")
+    validate_sync_branch_authority(source)
+    reject_protected_pushes(source)
     required = (
         "[[ \"$UPSTREAM_REF\" =~ ^[0-9a-f]{40}$ ]]",
         "[[ \"$UPSTREAM_SHA\" == \"$UPSTREAM_REF\" ]]",
-        'SYNC_BRANCH="sync/redis-exporter-upstream-${UPSTREAM_SHA}"',
+        'readonly SYNC_BRANCH="sync/redis-exporter-upstream-${UPSTREAM_SHA}"',
         'git read-tree --prefix=upstream/ "${UPSTREAM_SHA}^{tree}"',
-        '[[ "$REMOTE_SHA" == "$LOCAL_SHA" ]]',
+        '[[ "$(git rev-parse "$remote_ref")" == "$REMOTE_SHA" ]]',
+        'git rev-parse "${remote_ref}:upstream"',
+        'git rev-parse "${remote_ref}:CODESTRA_UPSTREAM_LOCK.json"',
+        'git merge-base --is-ancestor "${remote_parent_values[0]}" "$GITHUB_SHA"',
+        'git diff --name-only "${remote_parent_values[0]}" "$remote_ref"',
+        'LOCAL_SHA="$REMOTE_SHA"',
         "gh pr list",
         "Multiple open synchronization pull requests found.",
         "gh pr create",
@@ -84,6 +178,7 @@ def validate_workflow(source: str) -> None:
         "Bind vendored Git tree to exact official commit",
         "git rev-parse 'HEAD:upstream'",
         '[[ "$vendored_tree" == "$official_tree" ]]',
+        'scripts/reject_repository_secrets.sh .',
         'git diff --check "$base_sha" "$GITHUB_SHA" -- . \':(exclude)upstream\'',
     )
     for token in required:
@@ -97,12 +192,34 @@ def validate_workflow(source: str) -> None:
         raise ValueError("whitespace_check_must_use_committed_range")
 
 
+def validate_secret_scanner(source: str) -> None:
+    required = (
+        "set -Eeuo pipefail",
+        "-type f -o -type l",
+        'if [[ -L "$path" ]]',
+        "grep -aEiqz",
+        "client[_-]?secret",
+        "[[:space:]]*[:=]",
+        "PRIVATE KEY",
+        "Authorization",
+        "Bearer",
+        "scan_status=$?",
+        "Secret scan failed before completing",
+    )
+    for token in required:
+        if token not in source:
+            raise ValueError(f"secret_scanner_boundary_missing:{token}")
+    if '-path "$search_root/tests"' in source or "--exclude-dir=tests" in source:
+        raise ValueError("repository_tests_must_be_secret_scanned")
+
+
 def validate_repository() -> None:
     paths = {
         "source": ROOT / "CODESTRA_UPSTREAM.json",
         "lock": ROOT / "CODESTRA_UPSTREAM_LOCK.json",
         "sync": ROOT / ".github/workflows/upstream-source-sync.yml",
         "validate": ROOT / ".github/workflows/validate.yml",
+        "secret_scanner": ROOT / "scripts/reject_repository_secrets.sh",
     }
     for path in paths.values():
         if not path.is_file() or path.is_symlink():
@@ -111,10 +228,12 @@ def validate_repository() -> None:
     lock = json.loads(paths["lock"].read_text())
     sync_source = paths["sync"].read_text()
     validate_source = paths["validate"].read_text()
+    secret_scanner_source = paths["secret_scanner"].read_text()
     validate_upstream(source, lock)
     validate_sync(sync_source, yaml.safe_load(sync_source))
     yaml.safe_load(validate_source)
     validate_workflow(validate_source)
+    validate_secret_scanner(secret_scanner_source)
     if (ROOT / "upstream/.git").exists():
         raise ValueError("nested_upstream_git_metadata_forbidden")
 
