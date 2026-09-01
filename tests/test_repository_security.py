@@ -47,7 +47,7 @@ class RepositorySecurityTests(unittest.TestCase):
             '[[ "$(git rev-parse "$remote_ref")" == "$REMOTE_SHA" ]]',
             'git rev-parse "${remote_ref}:upstream"',
             'git rev-parse "${remote_ref}:CODESTRA_UPSTREAM_LOCK.json"',
-            'git merge-base --is-ancestor "${remote_parent_values[0]}" "$GITHUB_SHA"',
+            '[[ "${remote_parent_values[0]}" == "$GITHUB_SHA" ]]',
             'git diff --name-only "${remote_parent_values[0]}" "$remote_ref"',
             'LOCAL_SHA="$REMOTE_SHA"',
             "if (( ${#OPEN_PRS[@]} > 1 )); then",
@@ -112,6 +112,8 @@ class RepositorySecurityTests(unittest.TestCase):
             + '\n          git -c alias.x=push x origin HEAD:refs/heads/main',
             safe
             + '\n          git -calias.x=push x origin HEAD:refs/heads/main',
+            safe
+            + '\n          git config alias.x push; git x origin HEAD:refs/heads/main',
         ):
             with self.subTest(command=command):
                 unsafe = self.sync_source.replace(safe, command)
@@ -128,6 +130,16 @@ class RepositorySecurityTests(unittest.TestCase):
             VALIDATOR.validate_sync(body_only, yaml.safe_load(body_only))
 
     def test_bot_created_pr_dispatches_exact_branch_validation(self) -> None:
+        assignment = (
+            'readonly SYNC_BRANCH="sync/redis-exporter-upstream-'
+            '${UPSTREAM_SHA}-${GITHUB_SHA}"'
+        )
+        self.assertIn(assignment, self.sync_source)
+        without_epoch = self.sync_source.replace(
+            assignment, assignment.replace("-${GITHUB_SHA}", "")
+        )
+        with self.assertRaisesRegex(ValueError, "sync_branch_authority_invalid"):
+            VALIDATOR.validate_sync(without_epoch, yaml.safe_load(without_epoch))
         self.assertEqual(
             self.sync_document["permissions"],
             {"actions": "write", "contents": "write", "pull-requests": "write"},
@@ -136,6 +148,26 @@ class RepositorySecurityTests(unittest.TestCase):
             'gh workflow run validate.yml --repo "$GITHUB_REPOSITORY" --ref "$SYNC_BRANCH"',
             self.sync_source,
         )
+
+    def test_existing_sync_pr_identity_is_exact(self) -> None:
+        for token in (
+            'gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls"',
+            '-f head="${GITHUB_REPOSITORY_OWNER}:${SYNC_BRANCH}"',
+            '.head.repo.full_name',
+            '[[ "$pr_head_sha" == "$LOCAL_SHA" ]]',
+            '[[ "$pr_repository" == "$GITHUB_REPOSITORY" ]]',
+        ):
+            self.assertIn(token, self.sync_source)
+        for token in (
+            '[[ "$pr_head_sha" == "$LOCAL_SHA" ]]',
+            '[[ "$pr_repository" == "$GITHUB_REPOSITORY" ]]',
+        ):
+            with self.subTest(token=token):
+                unsafe = self.sync_source.replace(token, "true")
+                with self.assertRaisesRegex(
+                    ValueError, "reviewed_sync_boundary_missing"
+                ):
+                    VALIDATOR.validate_sync(unsafe, yaml.safe_load(unsafe))
 
     def test_sync_targets_the_first_promotion_branch(self) -> None:
         triggers = self.sync_document.get("on") or self.sync_document.get(True)
@@ -189,6 +221,33 @@ class RepositorySecurityTests(unittest.TestCase):
             )
             self.assertGreater(result.returncode, 1)
             self.assertIn("symbolic link", result.stderr)
+
+    def test_redis_runtime_password_assignments_are_rejected(self) -> None:
+        scanner = ROOT / "scripts/reject_repository_secrets.sh"
+        fixtures = (
+            "REDIS_" + "PASSWORD=actual-sensitive-value\n",
+            "REDIS_EXPORTER_BASIC_AUTH_" + "PASSWORD: actual-sensitive-value\n",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            credential = Path(directory) / "redis.env"
+            for fixture in fixtures:
+                with self.subTest(fixture=fixture.split(":", 1)[0]):
+                    credential.write_text(fixture)
+                    result = subprocess.run(
+                        [scanner, directory],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("secret pattern detected", result.stderr)
+            credential.write_text(
+                "REDIS_" + "PASSWORD=${REDIS_PASSWORD_FROM_SECRET_FILE}\n"
+            )
+            result = subprocess.run(
+                [scanner, directory], check=False, capture_output=True, text=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_whitespace_gate_checks_the_committed_base_to_head_range(self) -> None:
         source = (ROOT / ".github/workflows/validate.yml").read_text()

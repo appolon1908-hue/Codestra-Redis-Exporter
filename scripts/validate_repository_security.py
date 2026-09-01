@@ -12,7 +12,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-SYNC_WORKFLOW_SHA256 = "259eae301dce4756e9ce7924d44ffdb148ffcfd0bbab4e912afba6bb821d470e"
+SYNC_WORKFLOW_SHA256 = "0932e2f78c4b7bb9cc373821dfc454c1311da55563dd68bf6de11e4976830433"
 
 
 def logical_shell_lines(source: str) -> tuple[str, ...]:
@@ -101,6 +101,17 @@ def reject_protected_pushes(source: str) -> None:
                 command_index += 2 if option in {
                     "-c", "-C", "--git-dir", "--work-tree"
                 } else 1
+            if (
+                command_index < len(words)
+                and words[command_index] == "config"
+                and any(
+                    "alias." in argument.lower()
+                    or "$" in argument
+                    or "`" in argument
+                    for argument in words[command_index + 1 :]
+                )
+            ):
+                raise ValueError("protected_branch_sync_forbidden:dynamic_command")
             if command_index < len(words) and (
                 "$" in words[command_index] or "`" in words[command_index]
             ):
@@ -124,7 +135,7 @@ def reject_protected_pushes(source: str) -> None:
 
 
 def validate_sync_branch_authority(source: str) -> None:
-    expected = 'readonly SYNC_BRANCH="sync/redis-exporter-upstream-${UPSTREAM_SHA}"'
+    expected = 'readonly SYNC_BRANCH="sync/redis-exporter-upstream-${UPSTREAM_SHA}-${GITHUB_SHA}"'
     lines = logical_shell_lines(source)
     if lines.count(expected) != 1:
         raise ValueError("sync_branch_authority_invalid")
@@ -182,19 +193,23 @@ def validate_sync(source: str, document: dict) -> None:
     required = (
         "[[ \"$UPSTREAM_REF\" =~ ^[0-9a-f]{40}$ ]]",
         "[[ \"$UPSTREAM_SHA\" == \"$UPSTREAM_REF\" ]]",
-        'readonly SYNC_BRANCH="sync/redis-exporter-upstream-${UPSTREAM_SHA}"',
+        'readonly SYNC_BRANCH="sync/redis-exporter-upstream-${UPSTREAM_SHA}-${GITHUB_SHA}"',
         'git read-tree --prefix=upstream/ "${UPSTREAM_SHA}^{tree}"',
         '[[ "$(git rev-parse "$remote_ref")" == "$REMOTE_SHA" ]]',
         'git rev-parse "${remote_ref}:upstream"',
         'git rev-parse "${remote_ref}:CODESTRA_UPSTREAM_LOCK.json"',
-        'git merge-base --is-ancestor "${remote_parent_values[0]}" "$GITHUB_SHA"',
+        '[[ "${remote_parent_values[0]}" == "$GITHUB_SHA" ]]',
         'git diff --name-only "${remote_parent_values[0]}" "$remote_ref"',
         'LOCAL_SHA="$REMOTE_SHA"',
-        "gh pr list",
+        "gh api --method GET",
+        '-f base="development"',
+        '-f head="${GITHUB_REPOSITORY_OWNER}:${SYNC_BRANCH}"',
+        ".head.repo.full_name",
+        '[[ "$pr_head_sha" == "$LOCAL_SHA" ]]',
+        '[[ "$pr_repository" == "$GITHUB_REPOSITORY" ]]',
         "Multiple open synchronization pull requests found.",
         "gh pr create",
         "--base development",
-        "--base development --head",
         "github.ref == 'refs/heads/development'",
         'gh workflow run validate.yml --repo "$GITHUB_REPOSITORY" --ref "$SYNC_BRANCH"',
         "'synchronized_at': os.environ['UPSTREAM_TIMESTAMP']",
@@ -246,6 +261,8 @@ def validate_secret_scanner(source: str) -> None:
         "PRIVATE KEY",
         "Authorization",
         "Bearer",
+        "REDIS_PASSWORD",
+        "REDIS_EXPORTER_BASIC_AUTH_PASSWORD",
         "scan_status=$?",
         "Secret scan failed before completing",
     )
