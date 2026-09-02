@@ -1,0 +1,47 @@
+name: Validate Redis Exporter repository readiness
+on: [pull_request]
+permissions:
+  contents: read
+jobs:
+  validate-source:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+      - env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          python3 -m pip install --disable-pip-version-check --no-cache-dir -r requirements-validation.txt
+          python3 scripts/validate_repository_readiness.py
+          python3 -m unittest discover -s tests -p 'test_*.py'
+          git diff --check "$BASE_SHA" "$HEAD_SHA"
+      - name: Verify exact image and binary revision
+        run: |
+          image="$(python3 -c 'import json; print(json.load(open("codestra/release/runtime-image.lock.json"))["image"])')"
+          docker pull "$image"
+          readback="$(docker image inspect "$image" --format '{{index .RepoDigests 0}}')"
+          test "${readback##*@}" = "${image##*@}"
+          output="$(docker run --rm "$image" --version 2>&1)"
+          grep -F "072bd8bdabb60de075206fbebc9698edb1fff8f1" <<<"$output"
+  validate-merge-result:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+      - run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -m pip install --disable-pip-version-check --no-cache-dir -r requirements-validation.txt
+          python3 scripts/validate_repository_readiness.py
+          python3 -m unittest discover -s tests -p 'test_*.py'

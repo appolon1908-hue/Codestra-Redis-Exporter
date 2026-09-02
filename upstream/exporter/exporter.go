@@ -1,0 +1,1020 @@
+package exporter
+
+import (
+	"fmt"
+	"net/http"
+	"net/url"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	// see https://github.com/prometheus/client_golang/releases/tag/v1.22.0
+	_ "github.com/prometheus/client_golang/prometheus/promhttp/zstd"
+
+	"github.com/gomodule/redigo/redis"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	log "github.com/sirupsen/logrus"
+)
+
+type BuildInfo struct {
+	Version   string
+	CommitSha string
+	Date      string
+}
+
+// Exporter implements the prometheus.Exporter interface, and exports Redis metrics.
+type Exporter struct {
+	sync.Mutex
+
+	redisAddr    string
+	instanceRole string
+
+	totalScrapes              prometheus.Counter
+	scrapeDuration            prometheus.Summary
+	targetScrapeRequestErrors prometheus.Counter
+
+	metricDescriptions map[string]*prometheus.Desc
+	// labels each cached description was built with, to detect runtime changes
+	metricDescriptionLabels map[string][]string
+
+	options Options
+
+	metricMapCounters map[string]string
+	metricMapGauges   map[string]string
+
+	mux *http.ServeMux
+
+	buildInfo BuildInfo
+}
+
+type Options struct {
+	User                           string
+	Password                       string
+	Namespace                      string
+	PasswordMap                    map[string]string
+	ConfigCommandName              string
+	CheckKeys                      string
+	CheckSingleKeys                string
+	CheckStreams                   string
+	CheckSingleStreams             string
+	StreamsExcludeConsumerMetrics  bool
+	CheckKeysBatchSize             int64
+	CheckKeyGroups                 string
+	MaxDistinctKeyGroups           int64
+	CountKeys                      string
+	LuaScript                      map[string][]byte
+	LuaScriptReadOnly              bool
+	ClientCertFile                 string
+	ClientKeyFile                  string
+	CaCertFile                     string
+	TLSServerName                  string
+	InclConfigMetrics              bool
+	InclModulesMetrics             bool
+	InclSearchIndexesMetrics       bool
+	InclSentinelPeerInfo           bool
+	CheckSearchIndexes             string
+	DisableExportingKeyValues      bool
+	ExcludeLatencyHistogramMetrics bool
+	RedactConfigMetrics            bool
+	InclSystemMetrics              bool
+	InclRdbFileSizeMetric          bool
+	SkipTLSVerification            bool
+	SetClientName                  bool
+	IsTile38                       bool
+	IsCluster                      bool
+	ClusterDiscoverHostnames       bool
+	ExportClientList               bool
+	ExportClientsInclPort          bool
+	ConnectionTimeouts             time.Duration
+	MetricsPath                    string
+	RedisMetricsOnly               bool
+	PingOnConnect                  bool
+	RedisPwdFile                   string
+	Registry                       *prometheus.Registry
+	BuildInfo                      BuildInfo
+	BasicAuthUsername              string
+	BasicAuthPassword              string
+	BasicAuthHashPassword          string
+	SkipCheckKeysForRoleMaster     bool
+	InclMetricsForEmptyDatabases   bool
+	AppendInstanceRoleLabel        bool
+	DisableScrapeEndpoint          bool
+}
+
+func getInstanceRoleFromInfo(info string) string {
+	for line := range strings.SplitSeq(info, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "role:") {
+			split := strings.SplitN(line, ":", 2)
+			return split[1]
+		}
+	}
+	return ""
+}
+
+// NewRedisExporter returns a new exporter of Redis metrics.
+func NewRedisExporter(uri string, opts Options) (*Exporter, error) {
+	log.Debugf("NewRedisExporter options: %#v", opts)
+
+	switch {
+	case strings.HasPrefix(uri, "valkey://"):
+		uri = strings.Replace(uri, "valkey://", "redis://", 1)
+	case strings.HasPrefix(uri, "valkeys://"):
+		uri = strings.Replace(uri, "valkeys://", "rediss://", 1)
+	}
+
+	log.Debugf("NewRedisExporter = using redis uri: %s", uri)
+
+	if opts.InclSearchIndexesMetrics {
+		if _, err := regexp.Compile(opts.CheckSearchIndexes); err != nil {
+			return nil, fmt.Errorf("invalid check-search-indexes regex %q: %w", opts.CheckSearchIndexes, err)
+		}
+	}
+
+	if opts.Registry == nil {
+		opts.Registry = prometheus.NewRegistry()
+	}
+
+	e := &Exporter{
+		redisAddr: uri,
+		options:   opts,
+
+		buildInfo: opts.BuildInfo,
+
+		totalScrapes: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: opts.Namespace,
+			Name:      "exporter_scrapes_total",
+			Help:      "Current total redis scrapes.",
+		}),
+
+		scrapeDuration: prometheus.NewSummary(prometheus.SummaryOpts{
+			Namespace: opts.Namespace,
+			Name:      "exporter_scrape_duration_seconds",
+			Help:      "Durations of scrapes by the exporter",
+		}),
+
+		targetScrapeRequestErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: opts.Namespace,
+			Name:      "target_scrape_request_errors_total",
+			Help:      "Errors in requests to the exporter",
+		}),
+
+		metricMapGauges: map[string]string{
+			// # Server
+			"uptime_in_seconds": "uptime_in_seconds",
+			"process_id":        "process_id",
+			"io_threads_active": "io_threads_active",
+
+			// # Clients
+			"connected_clients":            "connected_clients",
+			"active_clients":               "active_clients", // Added in Redis 8.8
+			"blocked_clients":              "blocked_clients",
+			"maxclients":                   "max_clients",
+			"tracking_clients":             "tracking_clients",
+			"clients_in_timeout_table":     "clients_in_timeout_table",
+			"pubsub_clients":               "pubsub_clients",               // Added in Redis 7.4
+			"watching_clients":             "watching_clients",             // Added in Redis 7.4
+			"total_watched_keys":           "total_watched_keys",           // Added in Redis 7.4
+			"total_blocking_keys":          "total_blocking_keys",          // Added in Redis 7.2
+			"total_blocking_keys_on_nokey": "total_blocking_keys_on_nokey", // Added in Redis 7.2
+
+			// redis 2,3,4.x
+			"client_longest_output_list": "client_longest_output_list",
+			"client_biggest_input_buf":   "client_biggest_input_buf",
+
+			// the above two metrics were renamed in redis 5.x
+			"client_recent_max_output_buffer": "client_recent_max_output_buffer_bytes",
+			"client_recent_max_input_buffer":  "client_recent_max_input_buffer_bytes",
+
+			// # Memory
+			"allocator_active":     "allocator_active_bytes",
+			"allocator_allocated":  "allocator_allocated_bytes",
+			"allocator_resident":   "allocator_resident_bytes",
+			"allocator_frag_ratio": "allocator_frag_ratio",
+			"allocator_frag_bytes": "allocator_frag_bytes",
+			"allocator_muzzy":      "allocator_muzzy_bytes",
+			"allocator_rss_ratio":  "allocator_rss_ratio",
+			"allocator_rss_bytes":  "allocator_rss_bytes",
+
+			"used_memory":              "memory_used_bytes",
+			"used_memory_rss":          "memory_used_rss_bytes",
+			"used_memory_peak":         "memory_used_peak_bytes",
+			"used_memory_lua":          "memory_used_lua_bytes",
+			"used_memory_vm_eval":      "memory_used_vm_eval_bytes",      // Added in Redis 7.0
+			"used_memory_scripts_eval": "memory_used_scripts_eval_bytes", // Added in Redis 7.0
+			"used_memory_overhead":     "memory_used_overhead_bytes",
+			"used_memory_startup":      "memory_used_startup_bytes",
+			"used_memory_dataset":      "memory_used_dataset_bytes",
+			"number_of_cached_scripts": "number_of_cached_scripts",       // Added in Redis 7.0
+			"number_of_functions":      "number_of_functions",            // Added in Redis 7.0
+			"number_of_libraries":      "number_of_libraries",            // Added in Redis 7.4
+			"used_memory_vm_functions": "memory_used_vm_functions_bytes", // Added in Redis 7.0
+			"used_memory_scripts":      "memory_used_scripts_bytes",      // Added in Redis 7.0
+			"used_memory_functions":    "memory_used_functions_bytes",    // Added in Redis 7.0
+			"used_memory_vm_total":     "memory_used_vm_total",           // Added in Redis 7.0
+			"maxmemory":                "memory_max_bytes",
+
+			"maxmemory_reservation":         "memory_max_reservation_bytes",
+			"maxmemory_desired_reservation": "memory_max_reservation_desired_bytes",
+			"used_memory_hash_templates":    "memory_used_hash_templates_bytes", // Added in Redis 8.10
+
+			"maxfragmentationmemory_reservation":         "memory_max_fragmentation_reservation_bytes",
+			"maxfragmentationmemory_desired_reservation": "memory_max_fragmentation_reservation_desired_bytes",
+
+			"mem_fragmentation_ratio":  "mem_fragmentation_ratio",
+			"mem_fragmentation_bytes":  "mem_fragmentation_bytes",
+			"mem_clients_slaves":       "mem_clients_slaves",
+			"mem_clients_normal":       "mem_clients_normal",
+			"mem_cluster_links":        "mem_cluster_links_bytes",
+			"mem_aof_buffer":           "mem_aof_buffer_bytes",
+			"mem_replication_backlog":  "mem_replication_backlog_bytes",
+			"mem_replicas_repl_buffer": "mem_replicas_repl_buffer_bytes",
+
+			"expired_stale_perc":                          "expired_stale_percentage",
+			"expired_keys_with_volatile_items_stale_perc": "expired_keys_with_volatile_items_stale_percentage",
+
+			// https://github.com/antirez/redis/blob/17bf0b25c1171486e3a1b089f3181fff2bc0d4f0/src/evict.c#L349-L352
+			// ... the sum of AOF and slaves buffer ...
+			"mem_not_counted_for_evict":           "mem_not_counted_for_eviction_bytes",
+			"mem_total_replication_buffers":       "mem_total_replication_buffers_bytes",       // Added in Redis 7.0
+			"mem_overhead_db_hashtable_rehashing": "mem_overhead_db_hashtable_rehashing_bytes", // Added in Redis 7.4
+
+			"lazyfree_pending_objects": "lazyfree_pending_objects",
+			"lazyfreed_objects":        "lazyfreed_objects",
+			"active_defrag_running":    "active_defrag_running",
+
+			"migrate_cached_sockets": "migrate_cached_sockets_total",
+
+			"active_defrag_hits":       "defrag_hits",
+			"active_defrag_misses":     "defrag_misses",
+			"active_defrag_key_hits":   "defrag_key_hits",
+			"active_defrag_key_misses": "defrag_key_misses",
+
+			// # Persistence
+			"loading":                      "loading_dump_file",
+			"async_loading":                "async_loading", // Added in Redis 7.0
+			"rdb_changes_since_last_save":  "rdb_changes_since_last_save",
+			"rdb_bgsave_in_progress":       "rdb_bgsave_in_progress",
+			"backup_in_progress":           "backup_in_progress", // Added in Redis 8.10
+			"rdb_last_save_time":           "rdb_last_save_timestamp_seconds",
+			"rdb_last_bgsave_status":       "rdb_last_bgsave_status",
+			"rdb_last_bgsave_time_sec":     "rdb_last_bgsave_duration_sec",
+			"rdb_current_bgsave_time_sec":  "rdb_current_bgsave_duration_sec",
+			"rdb_saves":                    "rdb_saves_total",
+			"rdb_last_cow_size":            "rdb_last_cow_size_bytes",
+			"rdb_last_load_keys_expired":   "rdb_last_load_expired_keys", // Added in Redis 7.0
+			"rdb_last_load_keys_loaded":    "rdb_last_load_loaded_keys",  // Added in Redis 7.0
+			"aof_enabled":                  "aof_enabled",
+			"aof_rewrite_in_progress":      "aof_rewrite_in_progress",
+			"aof_rewrite_scheduled":        "aof_rewrite_scheduled",
+			"aof_last_rewrite_time_sec":    "aof_last_rewrite_duration_sec",
+			"aof_current_rewrite_time_sec": "aof_current_rewrite_duration_sec",
+			"aof_last_cow_size":            "aof_last_cow_size_bytes",
+			"aof_current_size":             "aof_current_size_bytes",
+			"aof_base_size":                "aof_base_size_bytes",
+			"aof_pending_rewrite":          "aof_pending_rewrite",
+			"aof_buffer_length":            "aof_buffer_length",
+			"aof_rewrite_buffer_length":    "aof_rewrite_buffer_length", // Added in Redis 7.0
+			"aof_pending_bio_fsync":        "aof_pending_bio_fsync",
+			"aof_delayed_fsync":            "aof_delayed_fsync",
+			"aof_last_bgrewrite_status":    "aof_last_bgrewrite_status",
+			"aof_last_write_status":        "aof_last_write_status",
+			"module_fork_in_progress":      "module_fork_in_progress",
+			"module_fork_last_cow_size":    "module_fork_last_cow_size",
+
+			// # Stats
+			"current_eviction_exceeded_time":         "current_eviction_exceeded_time_ms",
+			"pubsub_channels":                        "pubsub_channels",
+			"pubsub_patterns":                        "pubsub_patterns",
+			"pubsubshard_channels":                   "pubsubshard_channels", // Added in Redis 7.0.3
+			"latest_fork_usec":                       "latest_fork_usec",
+			"tracking_total_keys":                    "tracking_total_keys",
+			"tracking_total_items":                   "tracking_total_items",
+			"tracking_total_prefixes":                "tracking_total_prefixes",
+			"hash_templates":                         "hash_templates",                         // Added in Redis 8.10
+			"hash_template_keys":                     "hash_template_keys",                     // Added in Redis 8.10
+			"instantaneous_eventloop_cycles_per_sec": "instantaneous_eventloop_cycles_per_sec", // Added in Redis 7.0
+			"instantaneous_eventloop_duration_usec":  "instantaneous_eventloop_duration_usec",  // Added in Redis 7.0
+			"avg_pipeline_length":                    "client_processing_pipeline_length",      // Added in Redis 8.8
+			"slowlog_commands_time_ms_max":           "slowlog_commands_duration_seconds_max",  // Added in Redis 8.8
+
+			// # Replication
+			"connected_slaves":               "connected_slaves",
+			"repl_backlog_size":              "replication_backlog_bytes",
+			"repl_backlog_active":            "repl_backlog_is_active",
+			"repl_backlog_first_byte_offset": "repl_backlog_first_byte_offset",
+			"repl_backlog_histlen":           "repl_backlog_history_bytes",
+			"master_repl_offset":             "master_repl_offset",
+			"second_repl_offset":             "second_repl_offset",
+			"slave_expires_tracked_keys":     "slave_expires_tracked_keys",
+			"slave_priority":                 "slave_priority",
+			"sync_full":                      "replica_resyncs_full",
+			"sync_partial_ok":                "replica_partial_resync_accepted",
+			"sync_partial_err":               "replica_partial_resync_denied",
+			"replicas_repl_buffer_size":      "replicas_repl_buffer_size_bytes",
+			"replicas_repl_buffer_peak":      "replicas_repl_buffer_peak_bytes",
+			"replicas_waiting_psync":         "replicas_waiting_psync",
+
+			// # TLS (Valkey)
+			"tls_server_cert_expires_in_seconds": "tls_server_cert_expires_in_seconds",
+			"tls_client_cert_expires_in_seconds": "tls_client_cert_expires_in_seconds",
+			"tls_ca_cert_expires_in_seconds":     "tls_ca_cert_expires_in_seconds",
+
+			// # Scripting Engines (Valkey)
+			"engines_count":                 "scripting_engines_count",
+			"engines_total_used_memory":     "scripting_engines_memory_used_bytes",
+			"engines_total_memory_overhead": "scripting_engines_memory_overhead_bytes",
+
+			// # Cluster
+			"cluster_stats_messages_sent":     "cluster_messages_sent_total",
+			"cluster_stats_messages_received": "cluster_messages_received_total",
+
+			// # Tile38
+			// based on https://tile38.com/commands/server/
+			"tile38_aof_size":             "tile38_aof_size_bytes",
+			"tile38_avg_point_size":       "tile38_avg_item_size_bytes",
+			"tile38_sys_cpus":             "tile38_cpus_total",
+			"tile38_heap_released_bytes":  "tile38_heap_released_bytes",
+			"tile38_heap_alloc_bytes":     "tile38_heap_size_bytes",
+			"tile38_http_transport":       "tile38_http_transport",
+			"tile38_in_memory_size":       "tile38_in_memory_size_bytes",
+			"tile38_max_heap_size":        "tile38_max_heap_size_bytes",
+			"tile38_alloc_bytes":          "tile38_mem_alloc_bytes",
+			"tile38_num_collections":      "tile38_num_collections_total",
+			"tile38_num_hooks":            "tile38_num_hooks_total",
+			"tile38_num_objects":          "tile38_num_objects_total",
+			"tile38_num_points":           "tile38_num_points_total",
+			"tile38_pointer_size":         "tile38_pointer_size_bytes",
+			"tile38_read_only":            "tile38_read_only",
+			"tile38_go_threads":           "tile38_threads_total",
+			"tile38_go_goroutines":        "tile38_go_goroutines_total",
+			"tile38_last_gc_time_seconds": "tile38_last_gc_time_seconds",
+			"tile38_next_gc_bytes":        "tile38_next_gc_bytes",
+
+			// addtl. KeyDB metrics
+			"server_threads":        "server_threads_total",
+			"long_lock_waits":       "long_lock_waits_total",
+			"current_client_thread": "current_client_thread",
+
+			// Redis Modules metrics, RediSearch module
+			"search_number_of_indexes":   "search_number_of_indexes",
+			"search_used_memory_indexes": "search_used_memory_indexes_bytes",
+			"search_dialect_1":           "search_dialect_1",
+			"search_dialect_2":           "search_dialect_2",
+			"search_dialect_3":           "search_dialect_3",
+			"search_dialect_4":           "search_dialect_4",
+			// Legacy redis-stack v7.4 metrics
+			"search_global_idle":     "search_global_idle",
+			"search_global_total":    "search_global_total",
+			"search_bytes_collected": "search_collected_bytes",
+			// RediSearch module v8.0
+			"search_number_of_active_indexes":                 "search_number_of_active_indexes",
+			"search_number_of_active_indexes_running_queries": "search_number_of_active_indexes_running_queries",
+			"search_number_of_active_indexes_indexing":        "search_number_of_active_indexes_indexing",
+			"search_total_active_write_threads":               "search_total_active_write_threads",
+			"search_total_num_docs_in_indexes":                "search_total_num_docs_in_indexes",
+			"search_smallest_memory_index":                    "search_smallest_memory_index_bytes",
+			"search_largest_memory_index":                     "search_largest_memory_index_bytes",
+			"search_used_memory_vector_index":                 "search_used_memory_vector_index_bytes",
+			"search_global_idle_user":                         "search_global_idle_user",     // search_gc metrics were split into user and internal
+			"search_global_idle_internal":                     "search_global_idle_internal", // in PR: https://github.com/RediSearch/RediSearch/pull/5616
+			"search_global_total_user":                        "search_global_total_user",
+			"search_global_total_internal":                    "search_global_total_internal",
+			"search_gc_bytes_collected":                       "search_gc_collected_bytes", // search_bytes_collected was renamed in https://github.com/RediSearch/RediSearch/pull/5616
+			"search_gc_total_docs_not_collected":              "search_gc_total_docs_not_collected",
+			"search_gc_marked_deleted_vectors":                "search_gc_marked_deleted_vectors",
+			"search_errors_indexing_failures":                 "search_errors_indexing_failures",
+			// Valkey v8 metrics
+			"bf_bloom_total_memory_bytes":                "bf_bloom_total_memory_bytes",
+			"bf_bloom_num_objects":                       "bf_bloom_num_objects",
+			"bf_bloom_num_filters_across_objects":        "bf_bloom_num_filters_across_objects",
+			"bf_bloom_num_items_across_objects":          "bf_bloom_num_items_across_objects",
+			"bf_bloom_capacity_across_objects":           "bf_bloom_capacity_across_objects",
+			"json_total_memory_bytes":                    "json_total_memory_bytes",
+			"json_num_documents":                         "json_num_documents",
+			"search_used_memory_bytes":                   "search_used_memory_bytes",
+			"search_number_of_attributes":                "search_number_of_attributes",
+			"search_total_indexed_documents":             "search_total_indexed_documents",
+			"search_query_queue_size":                    "search_query_queue_size",
+			"search_writer_queue_size":                   "search_writer_queue_size",
+			"search_string_interning_store_size":         "search_string_interning_store_size",
+			"search_vector_externing_hash_extern_errors": "search_vector_externing_hash_extern_errors",
+			"search_vector_externing_num_lru_entries":    "search_vector_externing_num_lru_entries",
+		},
+
+		metricMapCounters: map[string]string{
+			"total_connections_received": "connections_received_total",
+			"total_commands_processed":   "commands_processed_total",
+
+			"rejected_connections":   "rejected_connections_total",
+			"total_net_input_bytes":  "net_input_bytes_total",
+			"total_net_output_bytes": "net_output_bytes_total",
+
+			"total_net_repl_input_bytes":  "net_repl_input_bytes_total",
+			"total_net_repl_output_bytes": "net_repl_output_bytes_total",
+
+			"expired_subkeys":                "expired_subkeys_total",
+			"expired_fields":                 "expired_fields_total",
+			"expired_keys":                   "expired_keys_total",
+			"expired_time_cap_reached_count": "expired_time_cap_reached_total",
+			"expire_cycle_cpu_milliseconds":  "expire_cycle_cpu_time_ms_total",
+			"evicted_keys":                   "evicted_keys_total",
+			"evicted_clients":                "evicted_clients_total", // Added in Redis 7.0
+			"evicted_scripts":                "evicted_scripts_total", // Added in Redis 7.4
+			"total_eviction_exceeded_time":   "eviction_exceeded_time_ms_total",
+			"keyspace_hits":                  "keyspace_hits_total",
+			"keyspace_misses":                "keyspace_misses_total",
+
+			"eventloop_cycles":                         "eventloop_cycles_total",                         // Added in Redis 7.0
+			"eventloop_duration_sum":                   "eventloop_duration_sum_usec_total",              // Added in Redis 7.0
+			"eventloop_duration_cmd_sum":               "eventloop_duration_cmd_sum_usec_total",          // Added in Redis 7.0
+			"eventloop_cycles_with_clients_processing": "eventloop_cycles_with_clients_processing_total", // Added in Redis 8.8
+			"total_client_processing_events":           "client_processing_events_total",                 // Added in Redis 8.8
+			"avg_pipeline_length_sum":                  "client_processing_pipeline_commands_total",      // Added in Redis 8.8
+			"avg_pipeline_length_cnt":                  "client_processing_pipeline_batches_total",       // Added in Redis 8.8
+			"slowlog_commands_count":                   "slowlog_commands_total",                         // Added in Redis 8.8
+			"slowlog_commands_time_ms_sum":             "slowlog_commands_duration_seconds_total",        // Added in Redis 8.8
+
+			"used_cpu_sys":              "cpu_sys_seconds_total",
+			"used_cpu_user":             "cpu_user_seconds_total",
+			"used_cpu_sys_children":     "cpu_sys_children_seconds_total",
+			"used_cpu_user_children":    "cpu_user_children_seconds_total",
+			"used_cpu_sys_main_thread":  "cpu_sys_main_thread_seconds_total",
+			"used_cpu_user_main_thread": "cpu_user_main_thread_seconds_total",
+
+			"unexpected_error_replies":                  "unexpected_error_replies",
+			"total_error_replies":                       "total_error_replies",
+			"dump_payload_sanitizations":                "dump_payload_sanitizations",
+			"total_reads_processed":                     "total_reads_processed",
+			"total_writes_processed":                    "total_writes_processed",
+			"io_threaded_reads_processed":               "io_threaded_reads_processed",
+			"io_threaded_writes_processed":              "io_threaded_writes_processed",
+			"client_query_buffer_limit_disconnections":  "client_query_buffer_limit_disconnections_total",
+			"client_output_buffer_limit_disconnections": "client_output_buffer_limit_disconnections_total",
+			"reply_buffer_shrinks":                      "reply_buffer_shrinks_total",
+			"reply_buffer_expands":                      "reply_buffer_expands_total",
+			"acl_access_denied_auth":                    "acl_access_denied_auth_total",
+			"acl_access_denied_cmd":                     "acl_access_denied_cmd_total",
+			"acl_access_denied_key":                     "acl_access_denied_key_total",
+			"acl_access_denied_channel":                 "acl_access_denied_channel_total",
+			"acl_access_denied_tls_cert":                "acl_access_denied_tls_cert_total",
+			"acl_access_denied_db":                      "acl_access_denied_db_total",
+
+			// addtl. KeyDB metrics
+			"cached_keys":                  "cached_keys_total",
+			"storage_provider_read_hits":   "storage_provider_read_hits",
+			"storage_provider_read_misses": "storage_provider_read_misses",
+
+			// Redis Modules metrics, RediSearch module
+			"search_total_indexing_time": "search_indexing_time_ms_total",
+			// Legacy redis-stack v7.4 metrics
+			"search_total_cycles": "search_cycles_total",
+			"search_total_ms_run": "search_run_ms_total",
+			// RediSearch module v8.0
+			"search_gc_total_cycles":               "search_gc_cycles_total", // search_gc metrics were renamed
+			"search_gc_total_ms_run":               "search_gc_run_ms_total", // in PR: https://github.com/RediSearch/RediSearch/pull/5616
+			"search_total_queries_processed":       "search_queries_processed_total",
+			"search_total_query_commands":          "search_query_commands_total",
+			"search_total_query_execution_time_ms": "search_query_execution_time_ms_total",
+			"search_total_active_queries":          "search_active_queries_total",
+			// Valkey v8 metrics
+			"bf_bloom_defrag_hits":                        "bf_bloom_defrag_hits_total",
+			"bf_bloom_defrag_misses":                      "bf_bloom_defrag_misses_total",
+			"search_worker_pool_suspend_cnt":              "search_worker_pool_suspend_count",
+			"search_writer_resumed_cnt":                   "search_writer_resumed_count",
+			"search_reader_resumed_cnt":                   "search_reader_resumed_count",
+			"search_writer_suspension_expired_cnt":        "search_writer_suspension_expired_count",
+			"search_rdb_load_success_cnt":                 "search_rdb_load_success_count",
+			"search_rdb_load_failure_cnt":                 "search_rdb_load_failure_count",
+			"search_rdb_save_success_cnt":                 "search_rdb_save_success_count",
+			"search_rdb_save_failure_cnt":                 "search_rdb_save_failure_count",
+			"search_successful_requests_count":            "search_successful_requests_count",
+			"search_failure_requests_count":               "search_failure_requests_count",
+			"search_hybrid_requests_count":                "search_hybrid_requests_count",
+			"search_inline_filtering_requests_count":      "search_inline_filtering_requests_count",
+			"search_hnsw_add_exceptions_count":            "search_hnsw_add_exceptions_count",
+			"search_hnsw_remove_exceptions_count":         "search_hnsw_remove_exceptions_count",
+			"search_hnsw_modify_exceptions_count":         "search_hnsw_modify_exceptions_count",
+			"search_hnsw_search_exceptions_count":         "search_hnsw_search_exceptions_count",
+			"search_hnsw_create_exceptions_count":         "search_hnsw_create_exceptions_count",
+			"search_vector_externing_entry_count":         "search_vector_externing_entry_count",
+			"search_vector_externing_generated_value_cnt": "search_vector_externing_generated_value_count",
+			"search_vector_externing_lru_promote_cnt":     "search_vector_externing_lru_promote_count",
+			"search_vector_externing_deferred_entry_cnt":  "search_vector_externing_deferred_entry_count",
+			"used_active_time_main_thread":                "active_time_main_thread_seconds_total",
+		},
+	}
+
+	if e.options.ConfigCommandName == "" {
+		e.options.ConfigCommandName = "CONFIG"
+	}
+
+	if keys, err := parseKeyArg(opts.CheckKeys); err != nil {
+		return nil, fmt.Errorf("couldn't parse check-keys: %s", err)
+	} else {
+		log.Debugf("keys: %#v", keys)
+	}
+
+	if singleKeys, err := parseKeyArg(opts.CheckSingleKeys); err != nil {
+		return nil, fmt.Errorf("couldn't parse check-single-keys: %s", err)
+	} else {
+		log.Debugf("singleKeys: %#v", singleKeys)
+	}
+
+	if streams, err := parseKeyArg(opts.CheckStreams); err != nil {
+		return nil, fmt.Errorf("couldn't parse check-streams: %s", err)
+	} else {
+		log.Debugf("streams: %#v", streams)
+	}
+
+	if singleStreams, err := parseKeyArg(opts.CheckSingleStreams); err != nil {
+		return nil, fmt.Errorf("couldn't parse check-single-streams: %s", err)
+	} else {
+		log.Debugf("singleStreams: %#v", singleStreams)
+	}
+
+	if countKeys, err := parseKeyArg(opts.CountKeys); err != nil {
+		return nil, fmt.Errorf("couldn't parse count-keys: %s", err)
+	} else {
+		log.Debugf("countKeys: %#v", countKeys)
+	}
+
+	if opts.InclSystemMetrics {
+		e.metricMapGauges["total_system_memory"] = "total_system_memory_bytes"
+	}
+
+	e.metricDescriptions = map[string]*prometheus.Desc{}
+	e.metricDescriptionLabels = map[string][]string{}
+
+	for k, desc := range map[string]struct {
+		txt  string
+		lbls []string
+	}{
+		"commands_duration_seconds_total":                    {txt: `Total amount of time in seconds spent per command`, lbls: []string{"cmd"}},
+		"commands_failed_calls_total":                        {txt: `Total number of errors prior command execution per command`, lbls: []string{"cmd"}},
+		"commands_latencies_usec":                            {txt: `A histogram of latencies per command`, lbls: []string{"cmd"}},
+		"commands_rejected_calls_total":                      {txt: `Total number of errors within command execution per command`, lbls: []string{"cmd"}},
+		"commands_slowlog_duration_seconds_max":              {txt: `Maximum slowlogged command execution time in seconds per command`, lbls: []string{"cmd"}},
+		"commands_slowlog_duration_seconds_total":            {txt: `Total slowlogged command execution time in seconds per command`, lbls: []string{"cmd"}},
+		"commands_slowlog_total":                             {txt: `Total number of slowlogged calls per command`, lbls: []string{"cmd"}},
+		"commands_total":                                     {txt: `Total number of calls per command`, lbls: []string{"cmd"}},
+		"active_clients":                                     {txt: `Number of clients active in Redis's rolling activity window`},
+		"client_processing_events_total":                     {txt: `Total attempts to process client input buffers`},
+		"client_processing_pipeline_batches_total":           {txt: `Total client input parsing batches that parsed at least one command`},
+		"client_processing_pipeline_commands_total":          {txt: `Total commands parsed across client input parsing batches`},
+		"client_processing_pipeline_length":                  {txt: `Average number of commands parsed per client input parsing batch`},
+		"connected_client_pipeline_batches_total":            {txt: `Total input parsing batches that parsed at least one command for this client`, lbls: []string{"id", "name"}},
+		"connected_client_pipeline_commands_total":           {txt: `Total commands parsed across input parsing batches for this client`, lbls: []string{"id", "name"}},
+		"connected_client_read_events_total":                 {txt: `Total read events for this client`, lbls: []string{"id", "name"}},
+		"eventloop_cycles_with_clients_processing_total":     {txt: `Total event loop cycles that processed client input buffers`},
+		"config_client_output_buffer_limit_bytes":            {txt: `The configured buffer limits per class`, lbls: []string{"class", "limit"}},
+		"config_client_output_buffer_limit_overcome_seconds": {txt: `How long for buffer limits per class to be exceeded before replicas are dropped`, lbls: []string{"class", "limit"}},
+		"config_key_value":                                   {txt: `Config key and value`, lbls: []string{"key", "value"}},
+		"config_value":                                       {txt: `Config key and value as metric`, lbls: []string{"key"}},
+		"connected_slave_lag_seconds":                        {txt: "Lag of connected slave", lbls: []string{"slave_ip", "slave_port", "slave_state"}},
+		"connected_slave_offset_bytes":                       {txt: "Offset of connected slave", lbls: []string{"slave_ip", "slave_port", "slave_state"}},
+		"db_avg_ttl_seconds":                                 {txt: "Avg TTL in seconds", lbls: []string{"db"}},
+		"db_keys":                                            {txt: "Total number of keys by DB", lbls: []string{"db"}},
+		"db_keys_cached":                                     {txt: "Total number of cached keys by DB", lbls: []string{"db"}},
+		"db_keys_expiring":                                   {txt: "Total number of expiring keys by DB", lbls: []string{"db"}},
+		"db_keys_with_expiring_items":                        {txt: "Total number of keys with expiring items by DB", lbls: []string{"db"}},
+		"errors_total":                                       {txt: `Total number of errors per error type`, lbls: []string{"err"}},
+		"exporter_last_scrape_error":                         {txt: "The last scrape error status.", lbls: []string{"err"}},
+		"key_group_count":                                    {txt: `Count of keys in key group`, lbls: []string{"db", "key_group"}},
+		"key_group_memory_usage_bytes":                       {txt: `Total memory usage of key group in bytes`, lbls: []string{"db", "key_group"}},
+		"key_memory_usage_bytes":                             {txt: `The memory usage of "key" in bytes`, lbls: []string{"db", "key"}},
+		"key_size":                                           {txt: `The length or size of "key"`, lbls: []string{"db", "key"}},
+		"key_value":                                          {txt: `The value of "key"`, lbls: []string{"db", "key"}},
+		"key_value_as_string":                                {txt: `The value of "key" as a string`, lbls: []string{"db", "key", "val"}},
+		"keys_count":                                         {txt: `Count of keys`, lbls: []string{"db", "key"}},
+		"last_key_groups_scrape_duration_milliseconds":       {txt: `Duration of the last key group metrics scrape in milliseconds`},
+		"last_slow_execution_duration_seconds":               {txt: `The amount of time needed for last slow execution, in seconds`},
+		"latency_percentiles_usec":                           {txt: `A summary of latency percentile distribution per command`, lbls: []string{"cmd"}},
+		"latency_spike_duration_seconds":                     {txt: `Length of the last latency spike in seconds`, lbls: []string{"event_name"}},
+		"latency_spike_last":                                 {txt: `When the latency spike last occurred`, lbls: []string{"event_name"}},
+		"master_last_io_seconds_ago":                         {txt: "Master last io seconds ago", lbls: []string{"master_host", "master_port"}},
+		"master_link_up":                                     {txt: "Master link status on Redis slave", lbls: []string{"master_host", "master_port"}},
+		"master_sync_in_progress":                            {txt: "Master sync in progress", lbls: []string{"master_host", "master_port"}},
+		"module_info":                                        {txt: "Information about loaded Redis module", lbls: []string{"name", "ver", "api", "filters", "usedby", "using"}},
+		"number_of_distinct_key_groups":                      {txt: `Number of distinct key groups`, lbls: []string{"db"}},
+		"rdb_current_size_bytes":                             {txt: "Current RDB file size in bytes"},
+		"script_result":                                      {txt: "Result of the collect script evaluation", lbls: []string{"filename"}},
+		"script_values":                                      {txt: "Values returned by the collect script", lbls: []string{"key", "filename"}},
+		"search_index_num_docs":                              {txt: "Number of documents in search index", lbls: []string{"index_name"}},
+		"search_index_max_doc_id":                            {txt: "Maximum document ID in search index", lbls: []string{"index_name"}},
+		"search_index_num_terms":                             {txt: "Number of distinct terms in search index", lbls: []string{"index_name"}},
+		"search_index_num_records":                           {txt: "Total number of records in search index", lbls: []string{"index_name"}},
+		"search_index_inverted_size_bytes":                   {txt: "Memory used by the inverted index", lbls: []string{"index_name"}},
+		"search_index_total_inverted_index_blocks":           {txt: "Total number of blocks in the inverted index", lbls: []string{"index_name"}},
+		"search_index_vector_index_size_bytes":               {txt: "Memory used by the vector index, stores vectors associated with each document", lbls: []string{"index_name"}},
+		"search_index_offset_vectors_size_bytes":             {txt: "Memory used by the offset vectors, store positional information for terms in documents", lbls: []string{"index_name"}},
+		"search_index_doc_table_size_bytes":                  {txt: "Memory used by the document table, contains metadata about each document in the index", lbls: []string{"index_name"}},
+		"search_index_sortable_values_size_bytes":            {txt: "Memory used by sortable values, used for sorting purposes", lbls: []string{"index_name"}},
+		"search_index_key_table_size_bytes":                  {txt: "Memory used by the key table, stores mapping between document IDs and keys", lbls: []string{"index_name"}},
+		"search_index_tag_overhead_size_bytes":               {txt: "Size of the TAG index structures used for optimising performance", lbls: []string{"index_name"}},
+		"search_index_text_overhead_size_bytes":              {txt: "Size of the TEXT index structures used for optimising performance", lbls: []string{"index_name"}},
+		"search_index_total_index_memory_size_bytes":         {txt: "Total memory consumed by all indexes in the DB", lbls: []string{"index_name"}},
+		"search_index_geoshapes_size_bytes":                  {txt: "Memory used by GEO-related fields", lbls: []string{"index_name"}},
+		"search_index_avg_per_doc_records":                   {txt: "Average number of records (including deletions) per document", lbls: []string{"index_name"}},
+		"search_index_avg_per_record_bytes":                  {txt: "Average size of each record in bytes", lbls: []string{"index_name"}},
+		"search_index_avg_per_term_offsets":                  {txt: "Average number of offsets (position information) per term", lbls: []string{"index_name"}},
+		"search_index_avg_per_record_offset_bits":            {txt: "Average number of bits used for offsets per record", lbls: []string{"index_name"}},
+		"search_index_indexing":                              {txt: "Indicates whether the index is currently being generated", lbls: []string{"index_name"}},
+		"search_index_percent_indexed":                       {txt: "Percentage of the index that has been successfully generated (0-1)", lbls: []string{"index_name"}},
+		"search_index_hash_indexing_failures":                {txt: "Number of failures encountered during indexing", lbls: []string{"index_name"}},
+		"search_index_number_of_uses_total":                  {txt: "Number of times the index has been used", lbls: []string{"index_name"}},
+		"search_index_cleaning":                              {txt: "Index deletion flag. A value of 1 indicates index deletion is in progress", lbls: []string{"index_name"}},
+		"sentinel_master_ckquorum_status":                    {txt: "Master ckquorum status", lbls: []string{"master_name", "message"}},
+		"sentinel_peer_info":                                 {txt: "Other Sentinel peers discovered via SENTINEL SENTINELS (one scrape from one Sentinel)", lbls: []string{"master_name", "master_address", "name", "ip", "port", "runid", "flags"}},
+		"sentinel_master_ok_sentinels":                       {txt: "The number of okay sentinels monitoring this master", lbls: []string{"master_name", "master_address"}},
+		"sentinel_master_ok_slaves":                          {txt: "The number of okay slaves of the master", lbls: []string{"master_name", "master_address"}},
+		"sentinel_master_sentinels":                          {txt: "The number of sentinels monitoring this master", lbls: []string{"master_name", "master_address"}},
+		"sentinel_master_setting_ckquorum":                   {txt: "Show the current ckquorum config for each master", lbls: []string{"master_name", "master_address"}},
+		"sentinel_master_setting_down_after_milliseconds":    {txt: "Show the current down-after-milliseconds config for each master", lbls: []string{"master_name", "master_address"}},
+		"sentinel_master_setting_failover_timeout":           {txt: "Show the current failover-timeout config for each master", lbls: []string{"master_name", "master_address"}},
+		"sentinel_master_setting_parallel_syncs":             {txt: "Show the current parallel-syncs config for each master", lbls: []string{"master_name", "master_address"}},
+		"sentinel_master_config_epoch":                       {txt: "The configuration epoch of the master (increments on each failover)", lbls: []string{"master_name", "master_address"}},
+		"sentinel_master_last_ok_ping_reply_seconds":         {txt: "Elapsed time in seconds since the last successful ping reply from the master", lbls: []string{"master_name", "master_address"}},
+		"sentinel_master_slaves":                             {txt: "The number of slaves of the master", lbls: []string{"master_name", "master_address"}},
+		"sentinel_master_status":                             {txt: "Master status on Sentinel", lbls: []string{"master_name", "master_address", "master_status"}},
+		"sentinel_masters":                                   {txt: "The number of masters this sentinel is watching"},
+		"sentinel_running_scripts":                           {txt: "Number of scripts in execution right now"},
+		"sentinel_scripts_queue_length":                      {txt: "Queue of user scripts to execute"},
+		"sentinel_simulate_failure_flags":                    {txt: "Failures simulations"},
+		"sentinel_tilt":                                      {txt: "Sentinel is in TILT mode"},
+		"sentinel_config_key_value":                          {txt: `Sentinel global config key and value`, lbls: []string{"key", "value"}},
+		"sentinel_config_value":                              {txt: `Sentinel global config key and value as metric`, lbls: []string{"key"}},
+		"scripting_engine_info":                              {txt: "Information about a Valkey scripting engine", lbls: []string{"engine", "module", "abi_version"}},
+		"scripting_engine_memory_used_bytes":                 {txt: "Memory used by a Valkey scripting engine", lbls: []string{"engine", "module", "abi_version"}},
+		"scripting_engine_memory_overhead_bytes":             {txt: "Memory overhead of a Valkey scripting engine", lbls: []string{"engine", "module", "abi_version"}},
+		"slave_info":                                         {txt: "Information about the Redis slave", lbls: []string{"master_host", "master_port", "read_only"}},
+		"slave_repl_offset":                                  {txt: "Slave replication offset", lbls: []string{"master_host", "master_port"}},
+		"commandlog_execution_slower_than":                   {txt: `Execution time threshold in microseconds for the slow command log`},
+		"commandlog_large_reply_length":                      {txt: `Total entries in the large-reply command log`},
+		"commandlog_large_reply_max_len":                     {txt: `Maximum number of entries retained in the large-reply command log`},
+		"commandlog_large_request_length":                    {txt: `Total entries in the large-request command log`},
+		"commandlog_large_request_max_len":                   {txt: `Maximum number of entries retained in the large-request command log`},
+		"commandlog_reply_larger_than":                       {txt: `Reply size threshold in bytes for the large-reply command log`},
+		"commandlog_request_larger_than":                     {txt: `Request size threshold in bytes for the large-request command log`},
+		"commandlog_slow_execution_max_len":                  {txt: `Maximum number of entries retained in the slow command log`},
+		"commandlog_slow_length":                             {txt: `Total entries in the slow command log`},
+		"slowlog_last_id":                                    {txt: `Last id of slowlog`},
+		"slowlog_length":                                     {txt: `Total slowlog`},
+		"slowlog_commands_duration_seconds_max":              {txt: `Maximum execution time in seconds among slowlogged commands`},
+		"slowlog_commands_duration_seconds_total":            {txt: `Total execution time in seconds of slowlogged commands`},
+		"slowlog_commands_total":                             {txt: `Total number of commands written to the slowlog`},
+		"start_time_seconds":                                 {txt: "Start time of the Redis instance since unix epoch in seconds."},
+		"stream_entries_added_total":                         {txt: "The count of all entries added to the stream during its lifetime", lbls: []string{"db", "stream"}},
+		"stream_first_entry_id":                              {txt: `The epoch timestamp (ms) of the first message in the stream`, lbls: []string{"db", "stream"}},
+		"stream_group_consumer_idle_seconds":                 {txt: `Consumer idle time in seconds`, lbls: []string{"db", "stream", "group", "consumer"}},
+		"stream_group_consumer_messages_pending":             {txt: `Pending number of messages for this specific consumer`, lbls: []string{"db", "stream", "group", "consumer"}},
+		"stream_group_consumers":                             {txt: `Consumers count of stream group`, lbls: []string{"db", "stream", "group"}},
+		"stream_group_entries_read":                          {txt: `Total number of entries read from the stream group`, lbls: []string{"db", "stream", "group"}},
+		"stream_group_lag":                                   {txt: `The number of messages waiting to be delivered to the stream group's consumers`, lbls: []string{"db", "stream", "group"}},
+		"stream_group_last_delivered_id":                     {txt: `The epoch timestamp (ms) of the last delivered message`, lbls: []string{"db", "stream", "group"}},
+		"stream_group_messages_nacked":                       {txt: `Number of messages currently in the stream group's NACK zone`, lbls: []string{"db", "stream", "group"}},
+		"stream_group_messages_pending":                      {txt: `Pending number of messages in that stream group`, lbls: []string{"db", "stream", "group"}},
+		"stream_groups":                                      {txt: `Groups count of stream`, lbls: []string{"db", "stream"}},
+		"stream_idmp_duplicates_total":                       {txt: `Total duplicate idempotent IDs detected during the stream's lifetime`, lbls: []string{"db", "stream"}},
+		"stream_idmp_duration_seconds":                       {txt: `Duration in seconds that each idempotent ID is retained`, lbls: []string{"db", "stream"}},
+		"stream_idmp_entries_added_total":                    {txt: `Total stream entries added with an idempotent ID`, lbls: []string{"db", "stream"}},
+		"stream_idmp_idempotent_ids_tracked":                 {txt: `Number of idempotent IDs currently tracked by the stream`, lbls: []string{"db", "stream"}},
+		"stream_idmp_max_size":                               {txt: `Maximum recent idempotent IDs retained per producer ID`, lbls: []string{"db", "stream"}},
+		"stream_idmp_producer_ids_tracked":                   {txt: `Number of idempotent producer IDs currently tracked by the stream`, lbls: []string{"db", "stream"}},
+		"stream_last_entry_id":                               {txt: `The epoch timestamp (ms) of the last message in the stream`, lbls: []string{"db", "stream"}},
+		"stream_last_generated_id":                           {txt: `The epoch timestamp (ms) of the latest message on the stream`, lbls: []string{"db", "stream"}},
+		"stream_length":                                      {txt: `The number of elements of the stream`, lbls: []string{"db", "stream"}},
+		"stream_max_deleted_entry_id":                        {txt: `The epoch timestamp (ms) of last message was deleted from the stream`, lbls: []string{"db", "stream"}},
+		"stream_radix_tree_keys":                             {txt: `Radix tree keys count"`, lbls: []string{"db", "stream"}},
+		"stream_radix_tree_nodes":                            {txt: `Radix tree nodes count`, lbls: []string{"db", "stream"}},
+		"tls_certificate_info":                               {txt: "Information about a Valkey TLS certificate", lbls: []string{"certificate", "serial"}},
+		"up":                                                 {txt: "Information about the Redis instance"},
+	} {
+		if e.options.AppendInstanceRoleLabel {
+			desc.lbls = append(desc.lbls, "instance_role") // append instance_role label to all metrics
+		}
+		e.metricDescriptions[k] = newMetricDescr(opts.Namespace, k, desc.txt, desc.lbls)
+		e.metricDescriptionLabels[k] = desc.lbls
+	}
+
+	if e.options.MetricsPath == "" {
+		e.options.MetricsPath = "/metrics"
+	}
+
+	e.mux = http.NewServeMux()
+
+	if e.options.Registry != nil {
+		e.options.Registry.MustRegister(e)
+		e.mux.Handle(e.options.MetricsPath, promhttp.HandlerFor(
+			e.options.Registry, promhttp.HandlerOpts{ErrorHandling: promhttp.ContinueOnError},
+		))
+
+		if !e.options.RedisMetricsOnly {
+			buildInfoCollector := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Namespace: opts.Namespace,
+				Name:      "exporter_build_info",
+				Help:      "redis exporter build_info",
+			}, []string{"version", "commit_sha", "build_date", "golang_version"})
+			buildInfoCollector.WithLabelValues(e.buildInfo.Version, e.buildInfo.CommitSha, e.buildInfo.Date, runtime.Version()).Set(1)
+			e.options.Registry.MustRegister(buildInfoCollector)
+		}
+	}
+
+	e.mux.HandleFunc("/", e.indexHandler)
+	if !e.options.DisableScrapeEndpoint {
+		e.mux.HandleFunc("/scrape", e.scrapeHandler)
+	}
+	e.mux.HandleFunc("/discover-cluster-nodes", e.discoverClusterNodesHandler)
+	e.mux.HandleFunc("/health", e.healthHandler)
+	e.mux.HandleFunc("/-/reload", e.reloadPwdFile)
+
+	return e, nil
+}
+
+// Describe outputs Redis metric descriptions.
+func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
+	for _, desc := range e.metricDescriptions {
+		ch <- desc
+	}
+
+	for _, v := range e.metricMapGauges {
+		if _, described := e.metricDescriptions[v]; !described {
+			ch <- newMetricDescr(e.options.Namespace, v, v+" metric", nil)
+		}
+	}
+
+	for _, v := range e.metricMapCounters {
+		if _, described := e.metricDescriptions[v]; !described {
+			ch <- newMetricDescr(e.options.Namespace, v, v+" metric", nil)
+		}
+	}
+
+	ch <- e.totalScrapes.Desc()
+	ch <- e.scrapeDuration.Desc()
+	ch <- e.targetScrapeRequestErrors.Desc()
+}
+
+// Collect fetches new metrics from the RedisHost and updates the appropriate metrics.
+func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
+	e.Lock()
+	defer e.Unlock()
+	e.totalScrapes.Inc()
+
+	if e.redisAddr != "" {
+		startTime := time.Now()
+		var up float64
+		if err := e.scrapeRedisHost(ch); err != nil {
+			e.registerConstMetricGauge(ch, "exporter_last_scrape_error", 1.0, fmt.Sprintf("%s", err))
+		} else {
+			up = 1
+			e.registerConstMetricGauge(ch, "exporter_last_scrape_error", 0, "")
+		}
+
+		e.registerConstMetricGauge(ch, "up", up)
+
+		took := time.Since(startTime).Seconds()
+		e.scrapeDuration.Observe(took)
+		e.registerConstMetricGauge(ch, "exporter_last_scrape_duration_seconds", took)
+	}
+
+	ch <- e.totalScrapes
+	ch <- e.scrapeDuration
+	ch <- e.targetScrapeRequestErrors
+}
+
+func (e *Exporter) extractConfigMetrics(ch chan<- prometheus.Metric, config map[string]string) (dbCount int, err error) {
+	for strKey, strVal := range config {
+		if strKey == "databases" {
+			if dbCount, err = strconv.Atoi(strVal); err != nil {
+				return 0, fmt.Errorf("invalid config value for key databases: %#v", strVal)
+			}
+		}
+
+		if e.options.InclConfigMetrics {
+			if redact := map[string]bool{
+				"masterauth":               true,
+				"requirepass":              true,
+				"tls-key-file-pass":        true,
+				"tls-client-key-file-pass": true,
+			}[strKey]; !redact || !e.options.RedactConfigMetrics {
+				e.registerConstMetricGauge(ch, "config_key_value", 1.0, strKey, strVal)
+				if val, err := strconv.ParseFloat(strVal, 64); err == nil {
+					e.registerConstMetricGauge(ch, "config_value", val, strKey)
+				}
+			}
+		}
+
+		if map[string]bool{
+			"io-threads":        true,
+			"maxclients":        true,
+			"maxmemory":         true,
+			"repl-backlog-size": true,
+		}[strKey] {
+			if val, err := strconv.ParseFloat(strVal, 64); err == nil {
+				strKey = strings.ReplaceAll(strKey, "-", "_")
+				e.registerConstMetricGauge(ch, fmt.Sprintf("config_%s", strKey), val)
+			}
+		}
+
+		if strKey == "client-output-buffer-limit" {
+			// client-output-buffer-limit "normal 0 0 0 slave 1610612736 1610612736 0 pubsub 33554432 8388608 60"
+			splitVal := strings.Split(strVal, " ")
+			for i := 0; i+3 < len(splitVal); i += 4 {
+				class := splitVal[i]
+				if val, err := strconv.ParseFloat(splitVal[i+1], 64); err == nil {
+					e.registerConstMetricGauge(ch, "config_client_output_buffer_limit_bytes", val, class, "hard")
+				}
+				if val, err := strconv.ParseFloat(splitVal[i+2], 64); err == nil {
+					e.registerConstMetricGauge(ch, "config_client_output_buffer_limit_bytes", val, class, "soft")
+				}
+				if val, err := strconv.ParseFloat(splitVal[i+3], 64); err == nil {
+					e.registerConstMetricGauge(ch, "config_client_output_buffer_limit_overcome_seconds", val, class, "soft")
+				}
+			}
+		}
+	}
+	return
+}
+
+func (e *Exporter) scrapeRedisHost(ch chan<- prometheus.Metric) error {
+	defer log.Debugf("scrapeRedisHost() done")
+
+	startTime := time.Now()
+	c, err := e.connectToRedis()
+	connectTookSeconds := time.Since(startTime).Seconds()
+	e.registerConstMetricGauge(ch, "exporter_last_scrape_connect_time_seconds", connectTookSeconds)
+
+	if err != nil {
+		var redactedAddr string
+		if redisURL, err2 := url.Parse(e.redisAddr); err2 != nil {
+			log.Debugf("url.Parse( %s ) err: %s", e.redisAddr, err2)
+			redactedAddr = "<redacted>"
+		} else {
+			redactedAddr = redisURL.Redacted()
+		}
+		log.Errorf("Couldn't connect to redis instance (%s)", redactedAddr)
+		log.Debugf("connectToRedis( %s ) err: %s", e.redisAddr, err)
+		return err
+	}
+	defer c.Close()
+
+	log.Debugf("connected to: %s", e.redisAddr)
+	log.Debugf("connecting took %f seconds", connectTookSeconds)
+
+	if e.options.PingOnConnect {
+		startTime := time.Now()
+
+		if _, err := doRedisCmd(c, "PING"); err != nil {
+			log.Errorf("Couldn't PING server, err: %s", err)
+		} else {
+			pingTookSeconds := time.Since(startTime).Seconds()
+			e.registerConstMetricGauge(ch, "exporter_last_scrape_ping_time_seconds", pingTookSeconds)
+			log.Debugf("PING took %f seconds", pingTookSeconds)
+		}
+	}
+
+	if e.options.SetClientName {
+		if _, err := doRedisCmd(c, "CLIENT", "SETNAME", "redis_exporter"); err != nil {
+			log.Errorf("Couldn't set client name, err: %s", err)
+		}
+	}
+
+	infoAll, err := redis.String(doRedisCmd(c, "INFO", "ALL"))
+	if err != nil || infoAll == "" {
+		log.Debugf("Redis INFO ALL err: %s", err)
+		infoAll, err = redis.String(doRedisCmd(c, "INFO"))
+		if err != nil {
+			log.Errorf("Redis INFO err: %s", err)
+			return err
+		}
+	}
+	log.Debugf("Redis INFO ALL result: [%#v]", infoAll)
+
+	if e.options.AppendInstanceRoleLabel {
+		e.instanceRole = getInstanceRoleFromInfo(infoAll)
+	}
+
+	dbCount := 0
+	if e.options.ConfigCommandName == "-" {
+		log.Debugf("Skipping extractConfigMetrics()")
+	} else {
+		if cfg, err := redis.StringMap(doRedisCmd(c, e.options.ConfigCommandName, "GET", "*")); err == nil {
+			dbCount, err = e.extractConfigMetrics(ch, cfg)
+			if err != nil {
+				log.Errorf("Redis extractConfigMetrics() err: %s", err)
+				return err
+			}
+
+			if e.options.InclRdbFileSizeMetric {
+				e.extractRdbFileSizeMetric(ch, cfg)
+			}
+		} else {
+			log.Debugf("Redis CONFIG err: %s", err)
+		}
+	}
+
+	if strings.Contains(infoAll, "cluster_enabled:1") {
+		if clusterInfo, err := redis.String(doRedisCmd(c, "CLUSTER", "INFO")); err == nil {
+			e.extractClusterInfoMetrics(ch, clusterInfo)
+
+			// in cluster mode Redis only supports one database, so no extra DB number padding needed
+			dbCount = 1
+		} else {
+			log.Errorf("Redis CLUSTER INFO err: %s", err)
+		}
+	} else if dbCount == 0 {
+		// in non-cluster mode, if dbCount is zero, then "CONFIG" failed to retrieve a valid
+		// number of databases, and we use the Redis config default which is 16
+
+		dbCount = 16
+	}
+
+	log.Debugf("dbCount: %d", dbCount)
+
+	role := e.extractInfoMetrics(ch, infoAll, dbCount)
+
+	if !e.options.ExcludeLatencyHistogramMetrics {
+		e.extractLatencyMetrics(ch, infoAll, c)
+	}
+
+	var keyConn redis.Conn
+	if e.options.IsCluster {
+		//
+		// in cluster mode we need to create a new, cluster-aware connection
+		// to properly handle cluster-redirects
+		//
+		k, keyConnErr := e.connectToRedisCluster()
+		if keyConnErr != nil {
+			log.Errorf("failed to get key operation connection: %s", keyConnErr)
+		} else {
+			//
+			// The "defer keyConn.Close()" ensures this temporary cluster connection gets
+			// cleaned up after key metrics extraction, while avoiding closing the original
+			// connection "c" which is still needed.
+			//
+			defer k.Close()
+			keyConn = k
+		}
+	} else {
+		// not in cluster mode - we can use our existing connection for retrieving keys and such
+		keyConn = c
+	}
+
+	// skip these metrics for master if SkipCheckKeysForRoleMaster is set
+	// (can help with reducing workload on the master node)
+	log.Debugf("checkKeys metric collection for role: %s  SkipCheckKeysForRoleMaster flag: %#v", role, e.options.SkipCheckKeysForRoleMaster)
+	if role == InstanceRoleSlave || !e.options.SkipCheckKeysForRoleMaster {
+		if keyConn != nil {
+			if err := e.extractCheckKeyMetrics(ch, keyConn); err != nil {
+				log.Errorf("extractCheckKeyMetrics() err: %s", err)
+			}
+			e.extractCountKeysMetrics(ch, keyConn)
+			e.extractStreamMetrics(ch, keyConn)
+		}
+	} else {
+		log.Infof("skipping checkKeys metrics, role: %s  flag: %#v", role, e.options.SkipCheckKeysForRoleMaster)
+	}
+
+	e.extractSlowLogMetrics(ch, c)
+	e.extractCommandLogMetrics(ch, c)
+
+	if keyConn != nil {
+		e.extractKeyGroupMetrics(ch, keyConn, dbCount)
+	}
+
+	if strings.Contains(infoAll, "# Sentinel") {
+		e.extractSentinelMetrics(ch, c)
+
+		e.extractSentinelConfig(ch, c)
+	}
+
+	if e.options.ExportClientList {
+		e.extractConnectedClientMetrics(ch, c)
+	}
+
+	if e.options.IsTile38 {
+		e.extractTile38Metrics(ch, c)
+	}
+
+	if e.options.InclModulesMetrics {
+		e.extractModulesMetrics(ch, c)
+	}
+
+	if e.options.InclSearchIndexesMetrics {
+		e.extractSearchIndexesMetrics(ch, c)
+	}
+
+	if len(e.options.LuaScript) > 0 {
+		for filename, script := range e.options.LuaScript {
+			if err := e.extractLuaScriptMetrics(ch, c, filename, script); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
