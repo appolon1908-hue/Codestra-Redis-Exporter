@@ -14,5 +14,6 @@
 - Exposure: private observability/cache networks, no host port or edge route
 - Persistence: none; Redis owns data
 - Release/rollback: exact image/config digests and checksum; previous artifacts must be pullable
+- Source hygiene: whitespace enforcement applies to Codestra-owned files; `upstream/` is byte-preserved and exempt through `.gitattributes`
 
 Current verdict: `SOURCE_PREPARED_NOT_DEPLOYED`. Registry release and rollback identities are not claimed by this profile.
