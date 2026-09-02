@@ -4,6 +4,8 @@ This repository is the service authority for Redis availability, memory, persist
 
 ## Least-privilege runtime
 
+The accepted source candidate is upstream v1.90.0 at commit `072bd8bdabb60de075206fbebc9698edb1fff8f1`, pinned as `docker.io/oliver006/redis_exporter@sha256:a129504e65b87c54f79bc92f1afc403475e8ff646a3d7512de469904ceddf986`. Selection does not activate it.
+
 The exporter runs as a non-root user with a read-only filesystem, no Linux capabilities, `no-new-privileges`, and no host port. It joins only the private observability and cache networks. Prometheus reaches `redis-exporter:9121/metrics`; `rdex.codestra.media` is an ownership/DNS identifier and does not authorize a public endpoint, Caddy/Kong route, or Docker `ports:` mapping.
 
 One exporter process owns exactly one deployment-controlled `REDIS_ADDR`. Both runtime candidates pass `--disable-scrape-endpoint`, so clients cannot select an arbitrary Redis target or inject `check-keys`, `check-single-keys`, streams, or count-key scans through `/scrape` query parameters. The runtime also disables key-value export, client-list export, client-port labels, the Redis `CONFIG` command, and TLS verification bypass.
@@ -61,6 +63,8 @@ Repository CI:
 - rejects inline credentials and mutable image examples.
 
 A future approved deployment may render the candidate only after the exact image, target, ACL, password map, private networks, and rollback packet are reviewed. No `docker compose up`, Redis ACL mutation, secret installation, or Prometheus target activation is authorized by this repository work.
+
+`deploy/compose.yaml` is the canonical deployment source. `codestra/runtime-v1/compose.yaml` is a compatibility candidate retained for central-suite migration tests; it must match the canonical image and safety policy and is not a second production authority.
 
 Before Prometheus target activation, later staging evidence must prove `redis_up == 1`, private-only reachability, `/scrape` returns not found, no inline credential, bounded samples, required labels, ACL denial of prohibited commands, password-map rotation, and rollback.
 

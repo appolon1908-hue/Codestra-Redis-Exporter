@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "1.0.0",
+  "artifactModel": "verified-upstream-image-plus-signed-config",
+  "upstreamRepository": "oliver006/redis_exporter",
+  "upstreamVersion": "v1.90.0",
+  "upstreamTagCommit": "072bd8bdabb60de075206fbebc9698edb1fff8f1",
+  "image": "docker.io/oliver006/redis_exporter@sha256:a129504e65b87c54f79bc92f1afc403475e8ff646a3d7512de469904ceddf986",
+  "linuxAmd64Manifest": "sha256:3241f17175ecd4162bf4c12fcb17a370515704664a951c81b95ecffe69aa756e",
+  "binaryRevisionReadback": "072bd8bdabb60de075206fbebc9698edb1fff8f1",
+  "upstreamSignature": {
+    "available": false,
+    "verification": "NO_SIGSTORE_SIGNATURE_PUBLISHED"
+  },
+  "productionActivation": false
+}
