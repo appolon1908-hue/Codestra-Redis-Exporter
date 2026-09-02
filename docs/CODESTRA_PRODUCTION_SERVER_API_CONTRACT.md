@@ -9,20 +9,21 @@
 - Core host `65.109.65.169`: approved per-instance exporter extension after central certification
 - Status: `SOURCE_CONTRACT_PREPARED_NOT_DEPLOYED`
 
-Redis Exporter owns the exporter runtime, approved instance model, metric allowlist, secret-reference contract, release evidence, and rollback. It does not own Redis administration, keys, values, application data, or business mutation.
+Redis Exporter owns the exporter runtime, approved single-instance model, metric allowlist, secret-reference contract, release evidence, and rollback. It does not own Redis administration, keys, values, application data, or business mutation.
 
 ## Native API surface
 
 | Method | Path | Purpose | Boundary |
 |---|---|---|---|
-| `GET` | `/metrics` | approved aggregate Redis metrics | private mTLS Prometheus scrape |
+| `GET` | `/metrics` | approved aggregate metrics for exactly one Redis instance | private mTLS Prometheus scrape |
 
-The multi-target `/scrape` endpoint must be disabled or unreachable. Unexpected `404` on `/metrics`, unexpected `5xx`, arbitrary target selection, or key/value exposure blocks production.
+The multi-target `/scrape` endpoint must be disabled and unreachable. Unexpected `404` on `/metrics`, unexpected `5xx`, arbitrary target selection, more than one configured Redis URI, or key/value exposure blocks production.
 
 ## Credential and target policy
 
-- Use one exporter per approved Redis instance or an equally strict source-controlled target allowlist.
-- Redis credentials come from external runtime secret files/OpenBao and use the exporter-supported format.
+- Run exactly one exporter instance for exactly one approved Redis target. Multi-target or allowlisted multi-target operation is not supported by the validated Codestra runtime.
+- The runtime password-map object contains exactly one key, and that key must equal the single configured Redis URI. Any additional URI, wildcard, user-supplied target, or missing match fails closed.
+- Redis credentials come from external runtime secret files/OpenBao and use the exporter-supported URI-to-password JSON map without committing values.
 - Do not embed a password in a URI, environment dump, Compose file, repository, metric, label, or log.
 - The Redis monitoring identity is read-only and cannot execute mutation or dangerous commands.
 - Key names, key values, customer identifiers, queues containing payload data, and command arguments are not exported.
@@ -32,11 +33,14 @@ The multi-target `/scrape` endpoint must be disabled or unreachable. Unexpected 
 
 ```text
 PROTECTED_PRODUCTION_SHA=PASS
+EXACTLY_ONE_EXPORTER_PER_REDIS_INSTANCE=PASS
+EXACTLY_ONE_CONFIGURED_REDIS_TARGET=PASS
+PASSWORD_MAP_KEY_EQUALS_CONFIGURED_URI=PASS
 READ_ONLY_REDIS_IDENTITY=PASS
 RUNTIME_SECRET_REFERENCE=PASS
 PASSWORD_IN_URI=NO
 ARBITRARY_SCRAPE_TARGET=NO
-TARGET_ALLOWLIST=PASS
+MULTI_TARGET_MODE=DISABLED
 KEY_VALUE_EXPORT=NO
 MTLS_SCRAPE=PASS
 IMMUTABLE_IMAGE_DIGEST=PASS
@@ -52,6 +56,8 @@ ROLLBACK_MANIFEST=PASS
 ```text
 GET_/metrics=PASS
 GET_/scrape_ARBITRARY_TARGET=DENIED
+EXACTLY_ONE_CONFIGURED_REDIS_TARGET=PASS
+PASSWORD_MAP_KEYS=EXACTLY_ONE_CONFIGURED_URI
 UNAUTHENTICATED_SCRAPE_DENIED=PASS
 MTLS_CLIENT_VERIFY=PASS
 READ_ONLY_REDIS_ACCESS=PASS
@@ -66,9 +72,11 @@ UNEXPECTED_5XX=0
 SOURCE_RUNTIME_DRIFT=0
 ```
 
+A second target requires a second independently configured exporter instance and secret mapping; it must not be added to the first exporter's map or selected through `/scrape`.
+
 ## Repository-first remediation
 
-Keep the old healthy exporter until the candidate passes. Fix every target, secret-format, or metric defect here with regression tests; commit/push; obtain exact-head CI/review; merge normally; rebuild/sign; update the BOM; and retry. Never edit a production exporter URI or credential mapping without updating this repository.
+Keep the old healthy exporter until the candidate passes. Fix every single-target, secret-format, or metric defect here with regression tests; commit/push; obtain exact-head CI/review; merge normally; rebuild/sign; update the BOM; and retry. Never edit a production exporter URI or credential mapping without updating this repository.
 
 ## Safety
 
