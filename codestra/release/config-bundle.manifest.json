@@ -11,6 +11,7 @@
     "codestra/runtime-v1/metrics-contract.json": "sha256:2274060e5d71691926aa22291b4f36890e46bf64dd402adca8e7352bd82ed771",
     "codestra/api/service-contract.v1.json": "sha256:81933ae2ab055d21ee4faece6642f26bc06ef9ec953dedfc1e187be196e79185",
     "scripts/validate_runtime_password_map.py": "sha256:b7ade79ad4dd607f960027b24ab59920cb8a37518f0be59f96f380508c1d0fed",
-    "codestra/release/runtime-image.lock.json": "sha256:4fe9dec112afb00208db49bfa23e0f8e428cde5f16f8a64bf01912bf1d9f0f79"
+    "codestra/release/runtime-image.lock.json": "sha256:4fe9dec112afb00208db49bfa23e0f8e428cde5f16f8a64bf01912bf1d9f0f79",
+    "CODESTRA_UPSTREAM_LOCK.json": "sha256:27994fb5dae117f2f82c9be1f19980a674deaf51cfd070fe72128ef28489cc45"
   }
 }

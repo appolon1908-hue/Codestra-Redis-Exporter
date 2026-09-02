@@ -27,6 +27,9 @@ def validate() -> None:
     lock = load("codestra/release/runtime-image.lock.json")
     if not IMAGE.fullmatch(str(lock.get("image", ""))): fail("runtime image is mutable")
     if lock.get("binaryRevisionReadback") != lock.get("upstreamTagCommit"): fail("binary/source revision mismatch")
+    upstream_lock = load("CODESTRA_UPSTREAM_LOCK.json")
+    if upstream_lock.get("upstream_commit") != lock.get("upstreamTagCommit"):
+        fail("vendored source commit does not equal the runtime image revision")
     if lock.get("productionActivation") is not False: fail("production activation must stay false")
     for relative in ("deploy/compose.yaml", "codestra/runtime-v1/compose.yaml"):
         source = (ROOT / relative).read_text()
@@ -39,7 +42,7 @@ def validate() -> None:
     if manifest.get("component") != "redis-exporter" or manifest.get("productionActivation") is not False:
         fail("configuration manifest identity/activation mismatch")
     files = manifest.get("files", {})
-    if len(files) != 7: fail("configuration manifest must contain seven governed files")
+    if len(files) != 8: fail("configuration manifest must contain eight governed files")
     for relative, expected in files.items():
         path = ROOT / relative
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(expected)) or "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest() != expected:

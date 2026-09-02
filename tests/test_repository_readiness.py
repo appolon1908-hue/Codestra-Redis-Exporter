@@ -17,6 +17,9 @@ class RepositoryReadinessTests(unittest.TestCase):
             self.assertEqual(names, set(manifest["files"]) | {"codestra/release/config-bundle.manifest.json"})
     def test_both_manifests_pin_one_private_image(self) -> None:
         lock = json.loads((ROOT / "codestra/release/runtime-image.lock.json").read_text())
+        upstream = json.loads((ROOT / "CODESTRA_UPSTREAM_LOCK.json").read_text())
+        self.assertEqual(upstream["upstream_commit"], lock["upstreamTagCommit"])
+        self.assertEqual(lock["binaryRevisionReadback"], lock["upstreamTagCommit"])
         for relative in ("deploy/compose.yaml", "codestra/runtime-v1/compose.yaml"):
             source = (ROOT / relative).read_text()
             self.assertIn(f"image: {lock['image']}", source)
