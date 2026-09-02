@@ -1,0 +1,9 @@
+{
+  "schemaVersion":"1.0",
+  "status":"REDIS_SCOPE_PREPARED_NOT_DEPLOYED",
+  "domain":"codestra-marketing-platform",
+  "requiredMetrics":["connections","memory","keys","evictions","hit_rate","latency","replication"],
+  "labels":["codestra_business","application","service","environment","server","region","deployment","redis_instance","redis_role"],
+  "forbiddenLabels":["tenant_id","customer_id","user_id","email","phone","key_name"],
+  "activation":{"runtimeApplied":false,"productionEnabled":false}
+}
