@@ -38,5 +38,10 @@ class RepositoryReadinessTests(unittest.TestCase):
             "777292781faeca9348d0e2ecdce6ac3f50c91d93",
         )
         self.assertEqual(job["with"]["component_id"], "redis-exporter")
+    def test_vendored_upstream_is_byte_preserved(self) -> None:
+        self.assertEqual(
+            (ROOT / ".gitattributes").read_text().splitlines()[-1],
+            "upstream/** -whitespace",
+        )
 
 if __name__ == "__main__": unittest.main()
