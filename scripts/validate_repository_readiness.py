@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib, json, re
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE = re.compile(r"^[a-z0-9./_-]+@sha256:[0-9a-f]{64}$")
 REQUIRED = (
@@ -11,6 +13,7 @@ REQUIRED = (
     "docs/BACKUP_RESTORE_ROLLBACK.md", "docs/UPGRADE.md",
     "codestra/release/runtime-image.lock.json", "codestra/release/config-bundle.manifest.json",
     ".github/workflows/release-config-bundle.yml", "scripts/build_config_bundle.py",
+    "requirements-validation.txt",
 )
 
 def fail(message: str) -> None:
@@ -51,10 +54,19 @@ def validate() -> None:
         for reference in re.findall(r"(?m)^\s*(?:-\s*)?uses:\s*([^\s#]+)", workflow.read_text()):
             if not reference.startswith("./") and not re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", reference):
                 fail(f"mutable action reference: {workflow.name}: {reference}")
-    caller = (ROOT / ".github/workflows/release-config-bundle.yml").read_text()
-    authority = "reusable-release-config-bundle.yml@777292781faeca9348d0e2ecdce6ac3f50c91d93"
-    if authority not in caller or "component_id: redis-exporter" not in caller:
-        fail("release caller authority/component mismatch")
+    caller = yaml.safe_load(
+        (ROOT / ".github/workflows/release-config-bundle.yml").read_text()
+    )
+    release_job = caller.get("jobs", {}).get("release", {})
+    authority = (
+        "appolon1908-hue/Codestra-Telemetry/.github/workflows/"
+        "reusable-release-config-bundle.yml@"
+        "777292781faeca9348d0e2ecdce6ac3f50c91d93"
+    )
+    if release_job.get("uses") != authority:
+        fail("release caller workflow authority mismatch")
+    if release_job.get("with", {}).get("component_id") != "redis-exporter":
+        fail("release caller component identity mismatch")
 
 def main() -> None:
     validate()
