@@ -11,7 +11,7 @@ services:
     security_opt:
       - no-new-privileges:true
     command:
-      - --redis.addr=${REDIS_ADDR:?set one private redis or rediss address without credentials}
+      - --redis.addr=${REDIS_ADDR:?set one private redis or rediss address with an explicit port and without credentials}
       - --redis.user=${REDIS_MONITOR_USER:-codestra_monitor}
       - --redis.password-file=/run/secrets/redis_password_map.json
       - --web.listen-address=0.0.0.0:9121
@@ -30,12 +30,15 @@ services:
       com.codestra.environment: ${CODESTRA_ENVIRONMENT:?set environment}
       com.codestra.deployment: ${CODESTRA_DEPLOYMENT:?set immutable deployment identifier}
       com.codestra.owner: platform-observability
-    secrets:
-      - source: redis_monitor_password_map
-        target: redis_password_map.json
-        uid: "59000"
-        gid: "59000"
-        mode: 0400
+      com.codestra.secret-file-owner: "59000:59000"
+      com.codestra.secret-file-mode: "0400"
+    volumes:
+      - type: bind
+        source: ${REDIS_MONITOR_PASSWORD_MAP_FILE:?mount an OpenBao-rendered file owned by 59000:59000 with mode 0400}
+        target: /run/secrets/redis_password_map.json
+        read_only: true
+        bind:
+          create_host_path: false
     tmpfs:
       - /tmp:size=16m,mode=1777
     networks:
@@ -49,10 +52,6 @@ services:
         reservations:
           cpus: "0.05"
           memory: 64M
-
-secrets:
-  redis_monitor_password_map:
-    file: ${REDIS_MONITOR_PASSWORD_MAP_FILE:?mount an OpenBao-rendered one-target JSON password map}
 
 networks:
   codestra_data:
