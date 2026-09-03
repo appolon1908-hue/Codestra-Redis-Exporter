@@ -3,52 +3,125 @@ name: Codestra Upstream Source Sync
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [development]
     paths:
       - CODESTRA_UPSTREAM.json
+      - codestra/release/runtime-image.lock.json
       - .github/workflows/upstream-source-sync.yml
 
 permissions:
   contents: write
+  pull-requests: write
+
+concurrency:
+  group: redis-exporter-upstream-source-sync
+  cancel-in-progress: false
 
 jobs:
   sync:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Check out protected development authority
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          ref: development
           fetch-depth: 0
-      - name: Import official upstream source
+          persist-credentials: true
+
+      - name: Import exact reviewed upstream source and refresh evidence atomically
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
           mapfile -t values < <(python3 - <<'PY'
           import json
           from pathlib import Path
-          data=json.loads(Path('CODESTRA_UPSTREAM.json').read_text())
-          print(data['upstream_clone_url']); print(data['upstream_ref']); print(data['import_path'])
+
+          authority = json.loads(Path('CODESTRA_UPSTREAM.json').read_text())
+          runtime = json.loads(Path('codestra/release/runtime-image.lock.json').read_text())
+          print(authority['upstream_clone_url'])
+          print(authority['upstream_ref'])
+          print(authority['import_path'])
+          print(runtime['upstreamTagCommit'])
           PY
           )
-          UPSTREAM_URL="${values[0]}"; UPSTREAM_REF="${values[1]}"; IMPORT_PATH="${values[2]}"
+          UPSTREAM_URL="${values[0]}"
+          UPSTREAM_REF="${values[1]}"
+          IMPORT_PATH="${values[2]}"
+          RUNTIME_UPSTREAM_COMMIT="${values[3]}"
+
           [[ "$UPSTREAM_URL" == "https://github.com/oliver006/redis_exporter.git" ]]
-          [[ "$UPSTREAM_REF" == "master" ]]
+          [[ "$UPSTREAM_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$UPSTREAM_REF" == "$RUNTIME_UPSTREAM_COMMIT" ]]
           [[ "$IMPORT_PATH" == "upstream" ]]
+
           rm -rf .codestra-upstream-src "$IMPORT_PATH"
-          GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 --branch "$UPSTREAM_REF" "$UPSTREAM_URL" .codestra-upstream-src
+          git init --quiet .codestra-upstream-src
+          git -C .codestra-upstream-src remote add origin "$UPSTREAM_URL"
+          GIT_LFS_SKIP_SMUDGE=1 git -C .codestra-upstream-src fetch --depth 1 --no-tags origin "$UPSTREAM_REF"
+          git -C .codestra-upstream-src checkout --quiet --detach FETCH_HEAD
           UPSTREAM_SHA="$(git -C .codestra-upstream-src rev-parse HEAD)"
+          [[ "$UPSTREAM_SHA" == "$UPSTREAM_REF" ]]
           rm -rf .codestra-upstream-src/.git
           mv .codestra-upstream-src "$IMPORT_PATH"
+
           export UPSTREAM_URL UPSTREAM_REF UPSTREAM_SHA
           python3 - <<'PY'
-          import json, os
-          from datetime import datetime, timezone
+          import hashlib
+          import json
+          import os
           from pathlib import Path
-          Path('CODESTRA_UPSTREAM_LOCK.json').write_text(json.dumps({'schema_version':'1.0','upstream_clone_url':os.environ['UPSTREAM_URL'],'upstream_ref':os.environ['UPSTREAM_REF'],'upstream_commit':os.environ['UPSTREAM_SHA'],'import_path':'upstream','synchronized_at':datetime.now(timezone.utc).isoformat(),'deployment_enabled':False,'secret_material_allowed_in_git':False},indent=2)+'\n')
+
+          lock = {
+              'schema_version': '1.1',
+              'upstream_clone_url': os.environ['UPSTREAM_URL'],
+              'upstream_ref': os.environ['UPSTREAM_REF'],
+              'upstream_commit': os.environ['UPSTREAM_SHA'],
+              'import_path': 'upstream',
+              'deterministic': True,
+              'deployment_enabled': False,
+              'secret_material_allowed_in_git': False,
+          }
+          Path('CODESTRA_UPSTREAM_LOCK.json').write_text(
+              json.dumps(lock, indent=2) + '\n', encoding='utf-8'
+          )
+
+          manifest_path = Path('codestra/release/config-bundle.manifest.json')
+          manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+          if manifest.get('productionActivation') is not False:
+              raise SystemExit('configuration bundle unexpectedly activates production')
+          files = manifest.get('files')
+          if not isinstance(files, dict) or 'CODESTRA_UPSTREAM_LOCK.json' not in files:
+              raise SystemExit('configuration manifest must bind the deterministic upstream lock')
+          refreshed = {}
+          for relative in files:
+              path = Path(relative)
+              if not path.is_file() or path.is_symlink():
+                  raise SystemExit(f'governed manifest path is not a regular file: {relative}')
+              refreshed[relative] = 'sha256:' + hashlib.sha256(path.read_bytes()).hexdigest()
+          manifest['files'] = refreshed
+          manifest_path.write_text(
+              json.dumps(manifest, indent=2) + '\n', encoding='utf-8'
+          )
           PY
+
+          python3 scripts/validate_runtime_password_map.py
           git config user.name 'codestra-upstream-sync'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add -A upstream CODESTRA_UPSTREAM_LOCK.json
+          git add -A upstream CODESTRA_UPSTREAM_LOCK.json codestra/release/config-bundle.manifest.json
           git diff --cached --quiet && exit 0
-          git commit -m "vendor: sync official Redis Exporter upstream ${UPSTREAM_SHA}"
-          git pull --rebase origin main
-          git push origin HEAD:main
+          git commit -m "vendor: sync reviewed Redis Exporter upstream ${UPSTREAM_SHA}"
+
+          SYNC_BRANCH="sync/redis-exporter-upstream-${UPSTREAM_SHA:0:12}-${GITHUB_SHA:0:12}"
+          git push origin "HEAD:refs/heads/${SYNC_BRANCH}"
+          existing_pr="$(gh pr list --head "$SYNC_BRANCH" --base development --state open --json number --jq '.[0].number // empty')"
+          if [[ -z "$existing_pr" ]]; then
+            gh pr create \
+              --base development \
+              --head "$SYNC_BRANCH" \
+              --title "vendor: review Redis Exporter upstream ${UPSTREAM_SHA:0:12}" \
+              --body "Deterministic source synchronization for the exact runtime-locked upstream commit. The upstream lock and signed configuration manifest are refreshed atomically. Merge only after exact-head CI, zero unresolved threads, and independent review. No deployment or production activation is authorized."
+          fi
