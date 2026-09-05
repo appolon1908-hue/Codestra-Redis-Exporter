@@ -190,6 +190,8 @@ def main() -> None:
     parser.add_argument("--expected-gid", type=int, default=PRODUCTION_GID)
     args = parser.parse_args()
 
+    # Validate CLI targets even when no password-map file is supplied.
+    normalized_target(args.redis_addr, args.redis_user)
     prove_policy()
     validate_compose(RUNTIME_COMPOSE, require_file_bind=True)
     validate_compose(AUTHORITY_COMPOSE, require_file_bind=False)
