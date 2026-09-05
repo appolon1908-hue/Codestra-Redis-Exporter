@@ -5,25 +5,24 @@ on:
     paths:
       - "codestra/runtime-v1/**"
       - "scripts/validate_runtime_password_map.py"
+      - "codestra/release/config-bundle.manifest.json"
+      - "codestra/release/runtime-image.lock.json"
       - ".github/workflows/validate-codestra-runtime-v1.yml"
+      - ".github/workflows/upstream-source-sync.yml"
       - "CODESTRA_UPSTREAM.json"
       - "CODESTRA_UPSTREAM_LOCK.json"
-      - ".gitmodules"
       - "upstream/**"
   push:
-    branches:
-      - development
-      - test
-      - staging
-      - production
-      - main
+    branches: [development, test, staging, production, main]
     paths:
       - "codestra/runtime-v1/**"
       - "scripts/validate_runtime_password_map.py"
+      - "codestra/release/config-bundle.manifest.json"
+      - "codestra/release/runtime-image.lock.json"
       - ".github/workflows/validate-codestra-runtime-v1.yml"
+      - ".github/workflows/upstream-source-sync.yml"
       - "CODESTRA_UPSTREAM.json"
       - "CODESTRA_UPSTREAM_LOCK.json"
-      - ".gitmodules"
       - "upstream/**"
 
 permissions:
@@ -38,15 +37,20 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+      - name: Check out exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Set up exact upstream Go toolchain
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
         with:
           go-version-file: upstream/go.mod
           cache-dependency-path: upstream/go.sum
 
       - name: Build and test the exact upstream exporter
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           cd upstream
           go build -trimpath -o ../.tmp-redis-exporter .
           go test ./exporter -run 'Test.*PwdFile|TestLoadPwdFile' -count=1
@@ -82,6 +86,7 @@ jobs:
           joined = '\n'.join(commands)
 
           assert 'ports' not in service
+          assert service['user'] == '59000:59000'
           assert service['read_only'] is True
           assert 'ALL' in service['cap_drop']
           assert '--redis.password-file=/run/secrets/redis_password_map.json' in commands
@@ -93,17 +98,24 @@ jobs:
           assert '--disable-exporting-key-values=true' in commands
           assert '--skip-tls-verification=false' in commands
           assert '@${' not in joined and 'redis://:' not in joined
+          assert 'secrets' not in service
+          mounts = [mount for mount in service['volumes'] if isinstance(mount, dict)]
+          assert len(mounts) == 1
+          mount = mounts[0]
+          assert mount['target'] == '/run/secrets/redis_password_map.json'
+          assert mount['read_only'] is True
+          assert mount['bind']['create_host_path'] is False
+          assert 'REDIS_MONITOR_PASSWORD_MAP_FILE' in mount['source']
           assert contract['rules']['multiTargetScrapeEndpointExposed'] is False
           assert contract['rules']['keyPatternScanningEnabled'] is False
           assert contract['rules']['clientListExportEnabled'] is False
           assert contract['rules']['monitoringAclIsReadOnly'] is True
           assert 'latest' not in text.lower()
-          print('Codestra Redis Exporter runtime validation PASS')
+          print('CODESTRA_REDIS_EXPORTER_RUNTIME=PASS')
           PY
 
-      - name: Render Compose with a valid one-target JSON password map
+      - name: Render with an ownership-preserving one-target password map
         env:
-          REDIS_EXPORTER_IMAGE: oliver006/redis_exporter:ci@sha256:0000000000000000000000000000000000000000000000000000000000000000
           REDIS_ADDR: rediss://redis.internal:6379
           REDIS_MONITOR_USER: codestra_monitor
           REDIS_MONITOR_PASSWORD_MAP_FILE: /tmp/codestra-redis-exporter-password-map.json
@@ -112,30 +124,44 @@ jobs:
           CODESTRA_ENVIRONMENT: test
           CODESTRA_DEPLOYMENT: exact-head-ci
         run: |
+          set -Eeuo pipefail
           printf '%s\n' '{"rediss://codestra_monitor@redis.internal:6379":"non-secret-ci-placeholder"}' > "$REDIS_MONITOR_PASSWORD_MAP_FILE"
           chmod 0400 "$REDIS_MONITOR_PASSWORD_MAP_FILE"
           python scripts/validate_runtime_password_map.py \
             --password-map "$REDIS_MONITOR_PASSWORD_MAP_FILE" \
             --redis-addr "$REDIS_ADDR" \
-            --redis-user "$REDIS_MONITOR_USER"
+            --redis-user "$REDIS_MONITOR_USER" \
+            --expected-uid "$(id -u)" \
+            --expected-gid "$(id -g)"
           docker compose -f codestra/runtime-v1/compose.yaml config >/tmp/codestra-redis-exporter-runtime.yaml
           test -s /tmp/codestra-redis-exporter-runtime.yaml
           grep -q -- '--disable-scrape-endpoint' /tmp/codestra-redis-exporter-runtime.yaml
           grep -q '/run/secrets/redis_password_map.json' /tmp/codestra-redis-exporter-runtime.yaml
           ! grep -Eq ':latest([[:space:]]|$)|published:|host_ip:|redis://:[^[:space:]]' /tmp/codestra-redis-exporter-runtime.yaml
 
-      - name: Prove raw or multi-target password files are rejected
+      - name: Prove invalid target spelling, raw files and multi-target maps fail closed
         env:
           REDIS_ADDR: rediss://redis.internal:6379
           REDIS_MONITOR_USER: codestra_monitor
         run: |
+          set -Eeuo pipefail
           printf '%s\n' 'raw-password' >/tmp/raw-password
+          chmod 0400 /tmp/raw-password
           ! python scripts/validate_runtime_password_map.py \
             --password-map /tmp/raw-password \
             --redis-addr "$REDIS_ADDR" \
-            --redis-user "$REDIS_MONITOR_USER"
+            --redis-user "$REDIS_MONITOR_USER" \
+            --expected-uid "$(id -u)" --expected-gid "$(id -g)"
           printf '%s\n' '{"rediss://codestra_monitor@redis.internal:6379":"one","rediss://codestra_monitor@other.internal:6379":"two"}' >/tmp/multi-target.json
+          chmod 0400 /tmp/multi-target.json
           ! python scripts/validate_runtime_password_map.py \
             --password-map /tmp/multi-target.json \
             --redis-addr "$REDIS_ADDR" \
+            --redis-user "$REDIS_MONITOR_USER" \
+            --expected-uid "$(id -u)" --expected-gid "$(id -g)"
+          ! python scripts/validate_runtime_password_map.py \
+            --redis-addr rediss://redis.internal \
             --redis-user "$REDIS_MONITOR_USER"
+
+      - name: Check committed whitespace
+        run: git diff --check
