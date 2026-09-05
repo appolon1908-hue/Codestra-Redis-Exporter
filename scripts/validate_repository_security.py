@@ -78,6 +78,10 @@ def reject_protected_pushes(source: str) -> None:
                     raise ValueError("protected_branch_sync_forbidden:dynamic_command")
         git_push = False
         for index, word in enumerate(words):
+            # Git also ships standalone transport executables; never allow
+            # these to sidestep the sole reviewed feature-branch push.
+            if re.search(r"(?:^|[\s/])git-(?:push|send-pack|http-push)(?:\s|$)", word):
+                raise ValueError("protected_branch_sync_forbidden:push_not_exact")
             if Path(word).name != "git":
                 continue
             command_index = index + 1

@@ -38,7 +38,7 @@ jobs:
           PYTHONPYCACHEPREFIX: /tmp/codestra-redis-exporter-pycache
         run: |
           python -m py_compile scripts/validate_repository_security.py tests/test_repository_security.py
-          python tests/test_repository_security.py
+          python -m unittest discover -s tests -p 'test_*.py' -v
           python scripts/validate_repository_security.py
 
       - name: Bind vendored Git tree to exact official commit
